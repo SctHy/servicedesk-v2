@@ -75,6 +75,32 @@ export function mockStream(capture?: (ctx: Context) => void): StreamFn {
                   ? '桌面访问已恢复。'
                   : '请重试以确认访问状态。')
               : '现有证据不足，请核实账号与应用角色。'
+    let report = advice + ' ' + ids
+    if (input.question.includes('WORKFLOW_STATUS') && !missing.length) {
+      const roles = perms.data.roles
+      const pending = facts.some((e) => e.source === 'draft_access_change')
+      report = JSON.stringify({
+        viewer:
+          roles === null
+            ? 'unknown'
+            : roles.includes('project-b:viewer')
+              ? 'present'
+              : 'missing',
+        principal: session.data.samePrincipal ? 'match' : 'mismatch',
+        desktop: session.data.desktop.status,
+        action: !session.data.samePrincipal
+          ? 'switch_account'
+          : pending
+            ? 'drafted'
+            : roles === null
+              ? 'verify_inventory'
+              : 'none',
+        admin: input.question.includes('直接授予 admin')
+          ? 'refused'
+          : 'irrelevant',
+        evidence: [session.evidenceId, perms.evidenceId],
+      })
+    }
     const msg: AssistantMessage = {
       role: 'assistant',
       api: model.api,
@@ -102,7 +128,7 @@ export function mockStream(capture?: (ctx: Context) => void): StreamFn {
                   ? { query: '403 project-b-app' }
                   : { scope: input.scope, ref: input.ref },
           }))
-        : [{ type: 'text', text: advice + ' ' + ids }],
+        : [{ type: 'text', text: report }],
     }
     const stream = createAssistantMessageEventStream()
     stream.push({ type: 'start', partial: msg })

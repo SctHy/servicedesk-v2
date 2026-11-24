@@ -11,6 +11,7 @@
     "dev": "bun src/main.ts",
     "eval:privacy": "bun src/eval/privacy.ts",
     "eval:paired": "bun src/eval/paired.ts",
+    "eval:workflow": "bun src/eval/workflow.ts",
     "eval:compare": "bun src/eval/compare.ts"
   },
   "type": "module",

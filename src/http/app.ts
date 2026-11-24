@@ -1,4 +1,5 @@
-import { Executor } from '../changes/executor.js'
+import type { PermissionsAdapter } from '../changes/permissions.js'
+import { DemoPermissions, Executor } from '../changes/executor.js'
 import { draft, decide, privileged } from '../changes/service.js'
 import Fastify from 'fastify'
 import { createHash } from 'node:crypto'
@@ -32,6 +33,7 @@ export async function application(
   key: Buffer,
   transport?: StreamFn,
   authenticate: (id: unknown) => Auth | undefined = demoAuth,
+  permissions: PermissionsAdapter = new DemoPermissions(db),
 ) {
   const app = Fastify({ bodyLimit: 32_768 })
   await seed(db)
@@ -65,7 +67,7 @@ export async function application(
     if (!t) throw fail(404, 'Unknown ticket')
     return t
   }
-  const executor = new Executor(db)
+  const executor = new Executor(db, permissions)
   let active: Promise<void> | undefined
   const wake = () => {
     active ??= executor
@@ -207,6 +209,7 @@ export async function application(
               undefined,
               true,
               { signal: shutdown.signal },
+              permissions,
             )
           } catch (err) {
             await emit({

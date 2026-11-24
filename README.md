@@ -68,3 +68,14 @@ LIVE_MODEL=1 bun run eval:paired > eval-output/paired.json
 ```
 
 双模型同场评测读取主模型的 `MODEL_*` 和对照模型的 `COMPARE_MODEL_BASE_URL`、`COMPARE_MODEL_ID`、`COMPARE_MODEL_API_KEY`。两组分别通过 MODEL_REASONING 和 COMPARE_MODEL_REASONING 设置推理档位。配置后运行 `LIVE_MODEL=1 bun run eval:compare`。两模型分别顺序完成全部 16 例，使用相同的问题、工具、网关和评分函数。终端输出汇总；脱敏逐例账本写入`eval-output/compare-live-v2.json`。执行失败或触发泄漏检测时命令返回非零。结果见 [M2 评测报告](docs/model-eval-report.md)。
+
+`bun run eval:workflow` 默认以 Mock 模型运行五条工单流程，覆盖审批生效、授权后切换账号、清单不可用、拒绝 admin 和人工核对。它通过真实调查与执行器检查最终业务状态、策略、带本轮证据引用的状态报告及调用和时间预算。使用本地模型配置运行 `LIVE_MODEL=1 bun run eval:workflow` 可获取真实模型的 JSON 账本，任一任务未通过时退出码为 1。
+
+### 可选 HTTP 权限服务
+
+默认使用 DemoPermissions。设置 `PERMISSIONS_API_URL` 后，执行器和同工单复查共用该服务。可选 `PERMISSIONS_API_TOKEN` 用于 Bearer 认证，`PERMISSIONS_TIMEOUT_MS` 默认 3000 毫秒。
+
+- `GET /grants?resource_key=<URL 编码的资源键>` 应返回 HTTP 200 和 `{"granted":true}` 或 `{"granted":false}`。读取失败表示状态未知，执行器转入人工核对。
+- `POST /grants` 接收 `{"resource_key":"…","role":"project-b:viewer"}`，成功返回 2xx。即使写请求报错，执行器也会重新读取权限确认结果。
+
+设置 `TEST_DATABASE_URL` 后运行 `bun test`，PostgreSQL 套件会在 HTTP 服务完成授权、响应仍挂起时对一次性 worker 发送 SIGKILL，再启动第二个 worker 接管过期租约，验证全程只写入一次。

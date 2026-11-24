@@ -1,4 +1,6 @@
-import { draft, appName } from '../changes/service.js'
+import type { PermissionsAdapter } from '../changes/permissions.js'
+import { DemoPermissions } from '../changes/executor.js'
+import { draft, appName, viewer } from '../changes/service.js'
 import {
   Agent,
   type StreamFn,
@@ -94,6 +96,7 @@ export async function investigate(
   },
   enableDraft = false,
   limits: { timeoutMs?: number; signal?: AbortSignal } = {},
+  permissions: PermissionsAdapter = new DemoPermissions(db),
 ) {
   const timeoutMs =
     limits.timeoutMs ?? Number(process.env.INVESTIGATION_TIMEOUT_MS ?? 60000)
@@ -190,14 +193,11 @@ export async function investigate(
         'roles' in raw &&
         Array.isArray(raw.roles)
       ) {
-        const grants = await db.rows('demo_grants', {
-          resource_key: JSON.stringify([
-            auth.tenant_id,
-            appName,
-            adapter.directory.name,
-          ]),
-        })
-        raw.roles = [...new Set([...raw.roles, ...grants.map((g) => g.role)])]
+        const granted = await permissions.read(JSON.stringify([auth.tenant_id, appName, adapter.directory.name]))
+        if (granted === null) {
+          raw.roles = null
+          Object.assign(raw, { roleInventory: 'unavailable' })
+        } else if (granted) raw.roles = [...new Set([...raw.roles, viewer])]
       }
       const row: Evidence = {
         id: crypto.randomUUID(),
@@ -238,9 +238,9 @@ export async function investigate(
       name: 'draft_access_change',
       label: '起草权限申请',
       description:
-        'After reading current session and permission evidence, draft a viewer change for approval only when the principal matches and the role is missing.',
+        'After reading current session and permission evidence, draft a project-b:viewer change for approval only when the principal matches and the role is missing.',
       parameters: Type.Object(
-        { role: Type.String() },
+        { role: Type.Literal(viewer) },
         { additionalProperties: false },
       ),
       async execute(_, args) {

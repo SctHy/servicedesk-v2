@@ -40,3 +40,6 @@ jobs:
       - run: bun run eval:paired
         env:
           LIVE_MODEL: '0'
+      - run: bun run eval:workflow
+        env:
+          LIVE_MODEL: '0'

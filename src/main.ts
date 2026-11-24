@@ -5,6 +5,7 @@ import { existsSync } from 'node:fs'
 import serve from '@fastify/static'
 import { PgStore, MemoryStore } from './db/store.js'
 import { application } from './http/app.js'
+import { configuredPermissions } from './changes/permissions.js'
 const url = process.env.DATABASE_URL
 const key = process.env.MASK_KEY
   ? Buffer.from(process.env.MASK_KEY, 'base64')
@@ -17,7 +18,7 @@ const db = url
   ? new PgStore(new pg.Pool({ connectionString: url }))
   : new MemoryStore()
 if (db instanceof PgStore) await db.migrate()
-const app = await application(db, key)
+const app = await application(db, key, undefined, undefined, configuredPermissions())
 if (existsSync('web/dist/index.html'))
   await app.register(serve, { root: resolve('web/dist') })
 await app.listen({ port: Number(process.env.PORT || 3000), host: '127.0.0.1' })

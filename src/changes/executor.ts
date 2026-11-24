@@ -2,7 +2,9 @@ import type { Store } from '../db/store.js'
 import type { Job } from './types.js'
 import { now, viewer } from './service.js'
 
-export class DemoPermissions {
+import type { PermissionsAdapter } from './permissions.js'
+
+export class DemoPermissions implements PermissionsAdapter {
   writes = 0
   fault?: 'crash_after_external_write' | 'unknown_external_state'
   constructor(private db: Store) {}
@@ -29,7 +31,7 @@ export class Executor {
   readonly owner = crypto.randomUUID()
   constructor(
     private db: Store,
-    readonly adapter = new DemoPermissions(db),
+    readonly adapter: PermissionsAdapter = new DemoPermissions(db),
     private leaseMs = 30000,
   ) {}
   async run() {
@@ -86,7 +88,7 @@ export class Executor {
         if (confirmed === false) {
           if (Date.parse(j.lease_until!) <= Date.now()) return
           await this.adapter.grant(j.resource_key)
-          if (this.adapter.fault === 'crash_after_external_write') return
+          if (this.adapter instanceof DemoPermissions && this.adapter.fault === 'crash_after_external_write') return
           confirmed = await this.adapter.read(j.resource_key)
         }
       } catch {

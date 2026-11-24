@@ -5,6 +5,7 @@ import { MemoryStore, PgStore, type Store, type Auth } from '../src/db/store'
 import { application } from '../src/http/app'
 import { mockStream } from '../src/investigation/mock'
 import { Executor, DemoPermissions } from '../src/changes/executor'
+import { HttpPermissions } from '../src/changes/permissions'
 import { investigate } from '../src/investigation/engine'
 import { fixture, type Observations } from '../src/adapters/demo'
 import { draft, decide, viewer, appName } from '../src/changes/service'
@@ -12,6 +13,38 @@ import { draft, decide, viewer, appName } from '../src/changes/service'
 const bob: Auth = { actor_id: 'bob', tenant_id: 'demo', department_id: 'it' }
 const carol: Auth = { ...bob, actor_id: 'carol', role: 'approver' }
 const input = { app: appName, role: viewer, reason: '读取项目资料' }
+function permissionServer(mode: 'ok' | 'write-error' | 'unknown' | 'hold' = 'ok') {
+  const grants = new Set<string>()
+  const methods: string[] = []
+  const written = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  let writes = 0
+  const server = Bun.serve({
+    hostname: '127.0.0.1', port: 0,
+    async fetch(req) {
+      const url = new URL(req.url)
+      if (url.pathname !== '/grants' || req.headers.get('Authorization') !== 'Bearer test')
+        return new Response(null, { status: 403 })
+      methods.push(req.method)
+      if (req.method === 'GET')
+        return mode === 'unknown' ? new Response(null, { status: 503 }) :
+          Response.json({ granted: grants.has(url.searchParams.get('resource_key')!) })
+      const body = await req.json()
+      if (req.method !== 'POST' || body.role !== viewer || typeof body.resource_key !== 'string')
+        return new Response(null, { status: 400 })
+      writes++
+      grants.add(body.resource_key)
+      written.resolve()
+      if (mode === 'hold') await release.promise
+      return new Response(null, { status: mode === 'write-error' ? 500 : 204 })
+    },
+  })
+  return {
+    url: server.url.href, adapter: new HttpPermissions(server.url.href, 'test'),
+    methods, written: written.promise, get writes() { return writes },
+    close() { release.resolve(); return server.stop(true) },
+  }
+}
 for (const pgMode of [false, true]) {
   describe.skipIf(pgMode && !process.env.TEST_DATABASE_URL)(
     pgMode ? 'M3 PostgreSQL' : 'M3 Memory',
@@ -20,6 +53,7 @@ for (const pgMode of [false, true]) {
         pool: pg.Pool | undefined,
         admin: pg.Pool | undefined,
         schema: string
+      let http: ReturnType<typeof permissionServer> | undefined
       beforeEach(async () => {
         if (!pgMode) {
           db = new MemoryStore()
@@ -37,6 +71,8 @@ for (const pgMode of [false, true]) {
         db = pgdb
       })
       afterEach(async () => {
+        await http?.close()
+        http = undefined
         if (pool) {
           await pool.end()
           await admin!.query('DROP SCHEMA ' + schema + ' CASCADE')
@@ -129,6 +165,8 @@ for (const pgMode of [false, true]) {
         }
       })
       it('rechecks a successful change and follows desktop account changes on one ticket', async () => {
+        http = permissionServer()
+        const permissions = http.adapter
         const ticket = {
           actor_id: bob.actor_id,
           tenant_id: bob.tenant_id,
@@ -158,6 +196,7 @@ for (const pgMode of [false, true]) {
             undefined,
             true,
             { timeoutMs: 3000 },
+            permissions,
           )
           expect(leaked).toBe(false)
           expect(result.toolFailures).toBe(0)
@@ -178,12 +217,13 @@ for (const pgMode of [false, true]) {
           decision: 'approve',
           payload_hash: change.payload_hash,
         })
-        const permissions = new DemoPermissions(db)
         const executor = new Executor(db, permissions)
         await executor.run()
         expect((await db.rows('changes', { id: change.id }))[0].status).toBe(
           'succeeded',
         )
+        expect(http.methods.slice(-3)).toEqual(['GET', 'POST', 'GET'])
+        expect((await db.rows('jobs', { change_id: change.id }))[0].status).toBe('succeeded')
         expect(await run('现在呢？')).toContain('权限已生效')
         const wrong = await run('权限已经批了但还是 403', {
           principal: 'external',
@@ -199,10 +239,59 @@ for (const pgMode of [false, true]) {
           1,
         )
         expect(await db.rows('jobs', { change_id: change.id })).toHaveLength(1)
-        expect(await db.rows('demo_grants', {})).toMatchObject([
-          { role: viewer },
-        ])
-        expect(permissions.writes).toBe(1)
+        expect(http.writes).toBe(1)
+      })
+      for (const mode of ['write-error', 'unknown'] as const) {
+        it('reconciles HTTP permission state: ' + mode, async () => {
+          http = permissionServer(mode)
+          const j = await queue()
+          const executor = new Executor(db, http.adapter)
+          await executor.run()
+          await executor.run()
+          const unknown = mode === 'unknown'
+          const status = unknown ? 'manual_review' : 'succeeded'
+          const [change] = await db.rows('changes', { id: j.change_id })
+          expect(change.status).toBe(status)
+          expect((await db.rows('jobs', { id: j.id }))[0].status).toBe(status)
+          expect(http.methods).toEqual(unknown ? ['GET'] : ['GET', 'POST', 'GET'])
+          expect(http.writes).toBe(unknown ? 0 : 1)
+          if (unknown) {
+            await decide(db, carol, change.id, {
+              decision: 'failed', payload_hash: change.payload_hash, note: '人工核对未授权',
+            }, true)
+            expect((await db.rows('jobs', { id: j.id }))[0].status).toBe('failed')
+          }
+        })
+      }
+      if (pgMode) it('recovers after SIGKILL between external write and response', async () => {
+        http = permissionServer('hold')
+        const j = await queue()
+        const url = new URL(process.env.TEST_DATABASE_URL!)
+        url.searchParams.set('options', '-c search_path=' + schema)
+        const spawn = () => Bun.spawn(['bun', 'src/changes/worker.ts'], {
+          env: { ...process.env, DATABASE_URL: url.href, PERMISSIONS_API_URL: http!.url,
+            PERMISSIONS_API_TOKEN: 'test', PERMISSIONS_TIMEOUT_MS: '3000', LEASE_MS: '300' },
+        })
+        const first = spawn()
+        try {
+          await Promise.race([http.written, first.exited.then(code => { throw Error('Worker exited early: ' + code) })])
+          first.kill('SIGKILL')
+          expect(await first.exited).not.toBe(0)
+        } finally {
+          if (first.exitCode === null && !first.signalCode) first.kill('SIGKILL')
+          await first.exited
+        }
+        const [running] = await db.rows('jobs', { id: j.id })
+        expect(running.status).toBe('running')
+        expect(http.writes).toBe(1)
+        await Bun.sleep(Math.max(0, Date.parse(running.lease_until!) - Date.now()) + 50)
+        expect(await spawn().exited).toBe(0)
+        expect(http.methods).toEqual(['GET', 'POST', 'GET'])
+        expect(http.writes).toBe(1)
+        expect((await db.rows('jobs', { id: j.id }))[0]).toMatchObject({
+          status: 'succeeded', attempt_count: 2,
+        })
+        expect((await db.rows('changes', { id: j.change_id }))[0].status).toBe('succeeded')
       })
       it('blocks both reviewer conflicts even with approval authority', async () => {
         const c = await draft(db, carol, input)
@@ -377,4 +466,11 @@ it('ends slow runs on deadline and shutdown, releasing the ticket queue', async 
     else process.env.INVESTIGATION_TIMEOUT_MS = previous
     await app.close()
   }
+})
+
+it('completes all five evidence-backed workflows offline', async () => {
+  const { runWorkflowEval } = await import('../src/eval/workflow')
+  const { results } = await runWorkflowEval(false)
+  expect(results.map((r) => r.passed)).toEqual([true, true, true, true, true])
+  expect(results.map((r) => r.externalWrites)).toEqual([1, 1, 0, 0, 1])
 })
