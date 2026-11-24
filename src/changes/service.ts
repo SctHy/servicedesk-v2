@@ -9,6 +9,15 @@ export const privileged = (a: Auth) =>
   a.role === 'approver' || a.role === 'admin'
 export const appName = 'project-b-app',
   viewer = 'project-b:viewer'
+export const grantPolicies = [{
+  app: appName,
+  role: viewer,
+  requires: [
+    { source: 'get_login_sessions', accepts: (data: Evidence['data']) => data.samePrincipal === true },
+    { source: 'get_app_permissions', accepts: (data: Evidence['data'], role: string, app: string) =>
+      data.app === app && Array.isArray(data.roles) && !data.roles.includes(role) },
+  ],
+}]
 export function resource(c: Change) {
   return JSON.stringify([c.tenant_id, c.app, c.beneficiary_principal])
 }
@@ -18,7 +27,8 @@ export async function draft(
   input: { app: unknown; role: unknown; reason: unknown },
   context?: { ticket: Ticket; beneficiary: string; evidence: Evidence[] },
 ) {
-  if (input?.role !== viewer || input?.app !== appName)
+  const policy = grantPolicies.find((p) => p.app === input?.app && p.role === input?.role)
+  if (!policy)
     throw error(403, 'Role outside grant policy')
   if (
     typeof input.reason !== 'string' ||
@@ -29,21 +39,14 @@ export async function draft(
   const reason = input.reason.trim()
   if (
     context &&
-    (context.ticket.scenario !== 'B' ||
-      context.ticket.actor_id !== a.actor_id ||
+    (context.ticket.actor_id !== a.actor_id ||
       context.ticket.tenant_id !== a.tenant_id ||
       !context.evidence.every((e) => e.ticket_id === context.ticket.id) ||
-      !context.evidence.some(
-        (e) =>
-          e.source === 'get_login_sessions' && e.data.samePrincipal === true,
-      ) ||
-      !context.evidence.some(
-        (e) =>
-          e.source === 'get_app_permissions' &&
-          e.data.app === appName &&
-          Array.isArray(e.data.roles) &&
-          !e.data.roles.includes(viewer),
-      ))
+      !policy.requires.every(({ source, accepts }) => {
+        const latest = context.evidence.filter((e) => e.source === source)
+          .sort((a, b) => a.observed_at.localeCompare(b.observed_at)).at(-1)
+        return latest && accepts(latest.data, policy.role, policy.app)
+      }))
   )
     throw error(403, 'Missing supporting evidence')
   const payload = {
@@ -51,8 +54,8 @@ export async function draft(
     ticket_id: context?.ticket.id ?? null,
     requester_id: a.actor_id,
     beneficiary_principal: context?.beneficiary ?? a.actor_id,
-    app: appName,
-    role: viewer,
+    app: policy.app,
+    role: policy.role,
     reason,
     evidence_ids: (context?.evidence ?? []).map((e) => e.id).sort(),
   }

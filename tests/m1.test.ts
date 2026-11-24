@@ -165,7 +165,7 @@ for (const backend of ['memory', 'postgres']) {
               scenario === 'A' ? '登错账号' : '建议申请 project-b:viewer',
             )
             const evidence = await db.rows('evidence', { ticket_id: id })
-            expect(evidence).toHaveLength(4)
+            expect(evidence).toHaveLength(5)
             for (const e of evidence)
               expect(stream.body.trim().split('\n').at(-1)).toContain(e.id)
             expect(
@@ -190,7 +190,7 @@ for (const backend of ['memory', 'postgres']) {
                 })
               ).body,
             ).toContain(evidence[0].id)
-            expect(await db.rows('evidence', { ticket_id: id })).toHaveLength(4)
+            expect(await db.rows('evidence', { ticket_id: id })).toHaveLength(5)
             expect(captured.join('')).not.toMatch(
               /alice|bob@|personal\.example|EMP-10|supersecret/,
             )

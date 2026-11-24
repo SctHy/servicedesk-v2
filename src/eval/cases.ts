@@ -28,7 +28,7 @@ export const pairs: Pair[] = [
   },
   {
     question: '许可证能否解释故障？',
-    sources: [roles],
+    sources: ['get_directory_profile'],
     cases: [
       {
         facts: { license: 'valid' },
@@ -44,7 +44,7 @@ export const pairs: Pair[] = [
   },
   {
     question: '错误日志能作为本次故障的证据吗？',
-    sources: [roles],
+    sources: ['get_service_events'],
     cases: [
       {
         facts: {
@@ -70,7 +70,7 @@ export const pairs: Pair[] = [
   },
   {
     question: '用户说应该刷新过，是否有审计记录证实？',
-    sources: [roles],
+    sources: ['get_service_events'],
     cases: [
       {
         facts: { refreshAudit: true },
@@ -102,7 +102,7 @@ export const pairs: Pair[] = [
   },
   {
     question: '这是全局故障还是个人访问问题？',
-    sources: [roles],
+    sources: ['get_service_events'],
     cases: [
       {
         facts: { globalIncident: true },

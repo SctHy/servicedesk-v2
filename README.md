@@ -71,11 +71,22 @@ LIVE_MODEL=1 bun run eval:paired > eval-output/paired.json
 
 `bun run eval:workflow` 默认以 Mock 模型运行五条工单流程，覆盖审批生效、授权后切换账号、清单不可用、拒绝 admin 和人工核对。它通过真实调查与执行器检查最终业务状态、策略、带本轮证据引用的状态报告及调用和时间预算。使用本地模型配置运行 `LIVE_MODEL=1 bun run eval:workflow` 可获取真实模型的 JSON 账本，任一任务未通过时退出码为 1。
 
+### v3 原始观测与稳定性
+
+目录工具读取身份、组和许可证，会话工具比对桌面与网页主体，应用工具读取角色清单与同步状态。服务事件工具返回故障、错误日志、刷新审计和服务状态，调查可按请求标识及事件时间核对。第五个只读工具检索当前用户可见的手册。起草工具按应用和角色策略验证工单归属及最新会话、权限证据，审批后由执行器写入并复核对应角色。
+
+```sh
+LIVE_MODEL=1 bun run eval:paired > eval-output/gpt-paired-v3.json
+LIVE_MODEL=1 WORKFLOW_RUNS=3 bun run eval:workflow > eval-output/gpt-workflow-v3.json
+```
+
+`WORKFLOW_RUNS` 默认为 1。每轮顺序运行五项独立任务。meanPassRate 是各轮通过率均值，passAtK 是至少通过一次的任务占比，passAllK 是每轮均通过的任务占比。perTask 按轮列出每项任务的通过情况，meanPerRun 给出每轮平均 token 用量和耗时。
+
 ### 可选 HTTP 权限服务
 
 默认使用 DemoPermissions。设置 `PERMISSIONS_API_URL` 后，执行器和同工单复查共用该服务。可选 `PERMISSIONS_API_TOKEN` 用于 Bearer 认证，`PERMISSIONS_TIMEOUT_MS` 默认 3000 毫秒。
 
-- `GET /grants?resource_key=<URL 编码的资源键>` 应返回 HTTP 200 和 `{"granted":true}` 或 `{"granted":false}`。读取失败表示状态未知，执行器转入人工核对。
+- `GET /grants?resource_key=<URL 编码的资源键>&role=<URL 编码的角色>` 应返回 HTTP 200 和 `{"granted":true}` 或 `{"granted":false}`。读取失败表示状态未知，执行器转入人工核对。
 - `POST /grants` 接收 `{"resource_key":"…","role":"project-b:viewer"}`，成功返回 2xx。即使写请求报错，执行器也会重新读取权限确认结果。
 
 设置 `TEST_DATABASE_URL` 后运行 `bun test`，PostgreSQL 套件会在 HTTP 服务完成授权、响应仍挂起时对一次性 worker 发送 SIGKILL，再启动第二个 worker 接管过期租约，验证全程只写入一次。

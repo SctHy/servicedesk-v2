@@ -8,3 +8,6 @@ eval-output/*
 !eval-output/deepseek-high-v2.json
 !eval-output/gpt-paired-v2.json
 !eval-output/gpt-workflow-v2.json
+
+!eval-output/gpt-paired-v3.json
+!eval-output/gpt-workflow-v3.json

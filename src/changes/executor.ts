@@ -8,16 +8,16 @@ export class DemoPermissions implements PermissionsAdapter {
   writes = 0
   fault?: 'crash_after_external_write' | 'unknown_external_state'
   constructor(private db: Store) {}
-  async read(key: string) {
+  async read(key: string, role = viewer) {
     if (this.fault === 'unknown_external_state') return null
     return (
-      (await this.db.rows('demo_grants', { resource_key: key, role: viewer }))
+      (await this.db.rows('demo_grants', { resource_key: key, role }))
         .length > 0
     )
   }
-  async grant(key: string) {
+  async grant(key: string, role = viewer) {
     this.writes++
-    await this.db.add('demo_grants', { resource_key: key, role: viewer })
+    await this.db.add('demo_grants', { resource_key: key, role })
   }
 }
 const fence = (j: Job) => ({
@@ -82,18 +82,19 @@ export class Executor {
     await this.db.locked(seen.resource_key, async (tx) => {
       const [j] = await tx.rows('jobs', fence(claimed))
       if (!j || Date.parse(j.lease_until!) <= Date.now()) return
+      const [change] = await tx.rows('changes', { id: j.change_id })
       let confirmed: boolean | null = null
       try {
-        confirmed = await this.adapter.read(j.resource_key)
+        confirmed = await this.adapter.read(j.resource_key, change.role)
         if (confirmed === false) {
           if (Date.parse(j.lease_until!) <= Date.now()) return
-          await this.adapter.grant(j.resource_key)
+          await this.adapter.grant(j.resource_key, change.role)
           if (this.adapter instanceof DemoPermissions && this.adapter.fault === 'crash_after_external_write') return
-          confirmed = await this.adapter.read(j.resource_key)
+          confirmed = await this.adapter.read(j.resource_key, change.role)
         }
       } catch {
         try {
-          confirmed = await this.adapter.read(j.resource_key)
+          confirmed = await this.adapter.read(j.resource_key, change.role)
         } catch {
           confirmed = null
         }

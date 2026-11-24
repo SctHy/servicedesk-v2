@@ -1,6 +1,6 @@
 import type { PermissionsAdapter } from '../changes/permissions.js'
 import { DemoPermissions } from '../changes/executor.js'
-import { draft, appName, viewer } from '../changes/service.js'
+import { draft, grantPolicies } from '../changes/service.js'
 import {
   Agent,
   type StreamFn,
@@ -155,6 +155,7 @@ export async function investigate(
     'get_login_sessions',
     'get_directory_profile',
     'get_app_permissions',
+    'get_service_events',
     'search_runbooks',
   ] as const
   const observed = new Map<string, Evidence>()
@@ -193,11 +194,14 @@ export async function investigate(
         'roles' in raw &&
         Array.isArray(raw.roles)
       ) {
-        const granted = await permissions.read(JSON.stringify([auth.tenant_id, appName, adapter.directory.name]))
-        if (granted === null) {
-          raw.roles = null
-          Object.assign(raw, { roleInventory: 'unavailable' })
-        } else if (granted) raw.roles = [...new Set([...raw.roles, viewer])]
+        for (const policy of grantPolicies.filter((p) => p.app === raw.app)) {
+          const granted = await permissions.read(JSON.stringify([auth.tenant_id, raw.app, adapter.directory.name]), policy.role)
+          if (granted === null) {
+            raw.roles = null
+            break
+          }
+          if (granted) raw.roles = [...new Set([...raw.roles, policy.role])]
+        }
       }
       const row: Evidence = {
         id: crypto.randomUUID(),
@@ -223,7 +227,10 @@ export async function investigate(
       await tool.execute(crypto.randomUUID(), { scope: owned.id, ref }, signal)
     }
   }
-  const roles = observed.get('get_app_permissions')?.data.roles
+  const policies = grantPolicies.filter((p) => p.requires.every(({ source, accepts }) => {
+    const row = observed.get(source)
+    return !row || accepts(row.data, p.role, p.app)
+  }))
   const canDraft =
     enableDraft &&
     !changes.some((c) =>
@@ -231,16 +238,15 @@ export async function investigate(
         c.status,
       ),
     ) &&
-    !(Array.isArray(roles) && roles.includes('project-b:viewer')) &&
-    observed.get('get_login_sessions')?.data.samePrincipal !== false
+    policies.length > 0
   if (canDraft)
     tools.push({
       name: 'draft_access_change',
       label: '起草权限申请',
       description:
-        'After reading current session and permission evidence, draft a project-b:viewer change for approval only when the principal matches and the role is missing.',
+        'Draft for approval after confirming a matching principal and missing role. Allowed grants: ' + policies.map((p) => p.app + '/' + p.role).join(', '),
       parameters: Type.Object(
-        { role: Type.Literal(viewer) },
+        { role: Type.Union(policies.map((p) => Type.Literal(p.role))) },
         { additionalProperties: false },
       ),
       async execute(_, args) {
@@ -252,11 +258,13 @@ export async function investigate(
         )
           throw Error('Invalid parameters')
         signal.throwIfAborted()
+        const policy = policies.find((p) => p.role === args.role && p.app === observed.get('get_app_permissions')?.data.app)
+        if (!policy) throw Error('Missing permission evidence for requested role')
         const c = await draft(
           db,
           auth,
           {
-            app: appName,
+            app: policy.app,
             role: args.role,
             reason: '调查证明当前账号缺少项目只读权限',
           },
@@ -264,7 +272,7 @@ export async function investigate(
             ticket: owned,
             beneficiary: adapter.directory.name,
             evidence: [...observed.values()].filter((e) =>
-              ['get_login_sessions', 'get_app_permissions'].includes(e.source),
+              policy.requires.some((r) => r.source === e.source),
             ),
           },
         )

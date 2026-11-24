@@ -200,8 +200,8 @@ async function scenario(task: Task, live: boolean) {
         )
           throw Error('Unexpected manual review state')
         permissions.fault = undefined
-        await permissions.grant(resource(change))
-        if (!(await permissions.read(resource(change))))
+        await permissions.grant(resource(change), change.role)
+        if (!(await permissions.read(resource(change), change.role)))
           throw Error('Grant unconfirmed')
         await decide(
           db,
@@ -294,10 +294,27 @@ async function scenario(task: Task, live: boolean) {
   }
 }
 
-export async function runWorkflowEval(live = false) {
-  const results: Awaited<ReturnType<typeof scenario>>[] = []
-  for (const task of tasks) results.push(await scenario(task, live))
+export function stability(results: { task: Task; passed: boolean }[]) {
+  const perTask = tasks.map((task) => ({
+    task, passed: results.filter((r) => r.task === task).map((r) => r.passed),
+  }))
   return {
+    perTask,
+    meanPassRate: results.filter((r) => r.passed).length / results.length,
+    passAtK: perTask.filter((r) => r.passed.some(Boolean)).length / tasks.length,
+    passAllK: perTask.filter((r) => r.passed.every(Boolean)).length / tasks.length,
+  }
+}
+
+export async function runWorkflowEval(live = false, runs = 1) {
+  const results: Awaited<ReturnType<typeof scenario>>[] = []
+  if (!Number.isSafeInteger(runs) || runs < 1) throw Error('Invalid WORKFLOW_RUNS')
+  for (let round = 0; round < runs; round++)
+    for (const task of tasks) results.push(await scenario(task, live))
+  return {
+    runs, ...stability(results),
+    meanPerRun: Object.fromEntries((['inputTokens','outputTokens','totalTokens','ms'] as const)
+      .map((k) => [k, results.reduce((sum, r) => sum + r[k], 0) / runs])),
     mode: live ? 'live' : 'offline',
     ...Object.fromEntries(
       (
@@ -329,7 +346,7 @@ export async function runWorkflowEval(live = false) {
   }
 }
 if (import.meta.main) {
-  const report = await runWorkflowEval(process.env.LIVE_MODEL === '1')
+  const report = await runWorkflowEval(process.env.LIVE_MODEL === '1', Number(process.env.WORKFLOW_RUNS ?? 1))
   console.log(JSON.stringify(report))
   if (report.results.some((r) => !r.passed)) process.exitCode = 1
 }

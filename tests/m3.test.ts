@@ -200,7 +200,7 @@ for (const pgMode of [false, true]) {
           )
           expect(leaked).toBe(false)
           expect(result.toolFailures).toBe(0)
-          expect(result.toolAttempts).toBeLessThanOrEqual(5)
+          expect(result.toolAttempts).toBeLessThanOrEqual(6)
           const answer = String(events.at(-1)?.text)
           for (const source of ['get_app_permissions', 'get_login_sessions']) {
             const fresh = events.find(
@@ -469,8 +469,50 @@ it('ends slow runs on deadline and shutdown, releasing the ticket queue', async 
 })
 
 it('completes all five evidence-backed workflows offline', async () => {
-  const { runWorkflowEval } = await import('../src/eval/workflow')
-  const { results } = await runWorkflowEval(false)
+  const { runWorkflowEval, stability } = await import('../src/eval/workflow')
+  const report = await runWorkflowEval(false, 3)
+  expect(report).toMatchObject({ runs: 3, meanPassRate: 1, passAtK: 1, passAllK: 1 })
+  expect(report.results).toHaveLength(15)
+  for (const task of report.perTask) expect(task.passed).toEqual([true, true, true])
+  expect(report.meanPerRun.ms).toBe(report.ms / 3)
+  const mixed = report.results.map(({ task }, i) => ({ task, passed: i % 5 !== 0 && i !== 1 }))
+  expect(stability(mixed)).toMatchObject({ meanPassRate: 11 / 15, passAtK: 4 / 5, passAllK: 3 / 5 })
+  const results = report.results.slice(0, 5)
   expect(results.map((r) => r.passed)).toEqual([true, true, true, true, true])
   expect(results.map((r) => r.externalWrites)).toEqual([1, 1, 0, 0, 1])
+})
+
+it('uses ticket ownership and latest observations even for fixture A', async () => {
+  const db = new MemoryStore()
+  const ticket = { ...bob, id: crypto.randomUUID(), scenario: 'A' as const }
+  const row = (source: string, data: Record<string, unknown>, observed_at: string) => ({
+    ticket_id: ticket.id, id: crypto.randomUUID(), source, data, observed_at,
+  })
+  const missing = row('get_app_permissions', { app: appName, roles: [] }, '2026-11-01')
+  const context = {
+    ticket, beneficiary: 'alice',
+    evidence: [row('get_login_sessions', { samePrincipal: true }, '2026-11-01'), missing],
+  }
+  expect((await draft(db, bob, input, context)).role).toBe(viewer)
+  await expect(draft(db, carol, input, context)).rejects.toThrow('Missing supporting evidence')
+  context.evidence.unshift(row('get_app_permissions', { app: appName, roles: [viewer] }, '2026-11-02'))
+  await expect(draft(db, bob, input, context)).rejects.toThrow('Missing supporting evidence')
+})
+
+it('separates directory, application and raw service observations', () => {
+  const adapter = fixture('B', {
+    license: 'expired', member: true, refreshAudit: true, globalIncident: false,
+    incidentAt: '2026-11-01T12:00:00Z', logAt: '2026-11-01T12:00:01Z',
+    incidentRequest: 'req-1', logRequest: 'req-2',
+  })
+  const ref = adapter.directory.email
+  expect(adapter.get_directory_profile(ref).license).toBe('expired')
+  expect(adapter.get_app_permissions(ref)).toEqual({ app: appName, roles: [], directorySyncPending: true })
+  expect(adapter.get_service_events(ref)).toEqual({
+    incident: { occurredAt: '2026-11-01T12:00:00Z', requestId: 'req-1' },
+    errorLogs: [{ eventAt: '2026-11-01T12:00:01Z', requestId: 'req-2', status: 403 }],
+    auditEvents: [{ action: 'refresh', recordedAt: '2026-11-01T12:01:00Z' }],
+    serviceStatus: { globalOutage: false },
+  })
+  expect(() => adapter.get_service_events('unbound')).toThrow('Subject unavailable')
 })

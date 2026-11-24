@@ -184,7 +184,7 @@ it('rejects extra tool fields before reading the adapter', async () => {
     },
   )
   expect(rejected).toBe(true)
-  expect(await db.rows('evidence', { ticket_id: t.id })).toHaveLength(4)
+  expect(await db.rows('evidence', { ticket_id: t.id })).toHaveLength(5)
 })
 
 it('accepts typographic variants of a single decision without inferring a code from prose', async () => {

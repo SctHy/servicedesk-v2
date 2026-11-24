@@ -23,6 +23,7 @@ export function fixture(
     name,
     email,
     employeeId: scenario === 'A' ? 'EMP-101' : 'EMP-102',
+    ...(observations.license && { license: observations.license }),
     groups: observations.member === false ? [] : ['project-b-team'],
   }
   const session = {
@@ -64,17 +65,6 @@ export function fixture(
       check(value)
       return {
         app: 'project-b-app',
-        ...Object.fromEntries(
-          Object.entries(observations).filter(
-            ([k]) =>
-              ![
-                'principal',
-                'sessionEmail',
-                'member',
-                'desktopStatus',
-              ].includes(k),
-          ),
-        ),
         ...(observations.member === undefined
           ? {}
           : { directorySyncPending: true }),
@@ -84,6 +74,15 @@ export function fixture(
             : scenario === 'A'
               ? ['project-b:viewer']
               : [],
+      }
+    },
+    get_service_events(value: string) {
+      check(value)
+      return {
+        ...(observations.incidentAt && { incident: { occurredAt: observations.incidentAt, requestId: observations.incidentRequest } }),
+        errorLogs: observations.logAt ? [{ eventAt: observations.logAt, requestId: observations.logRequest, status: 403 }] : [],
+        auditEvents: observations.refreshAudit ? [{ action: 'refresh', recordedAt: '2026-11-01T12:01:00Z' }] : [],
+        ...(observations.globalIncident !== undefined && { serviceStatus: { globalOutage: observations.globalIncident } }),
       }
     },
   }

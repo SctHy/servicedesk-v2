@@ -74,6 +74,7 @@ export async function privacyReport() {
         adapter.directory,
         adapter.get_app_permissions(email),
         pair.question + (c.prompt ?? ''),
+        adapter.get_service_events(email),
       ]
       const safe = (await vault.project(args)) as typeof args
       preserved += Number(classify(...args) === classify(...safe))

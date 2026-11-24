@@ -1,8 +1,8 @@
 import { viewer } from './service.js'
 
 export interface PermissionsAdapter {
-  read(key: string): Promise<boolean | null>
-  grant(key: string): Promise<void>
+  read(key: string, role?: string): Promise<boolean | null>
+  grant(key: string, role?: string): Promise<void>
 }
 
 export class HttpPermissions implements PermissionsAdapter {
@@ -26,9 +26,9 @@ export class HttpPermissions implements PermissionsAdapter {
     })
   }
 
-  async read(key: string) {
+  async read(key: string, role = viewer) {
     try {
-      const response = await this.request(this.endpoint + '?' + new URLSearchParams({ resource_key: key }))
+      const response = await this.request(this.endpoint + '?' + new URLSearchParams({ resource_key: key, role }))
       if (response.status !== 200) return null
       const data = await response.json()
       return typeof data?.granted === 'boolean' ? data.granted as boolean : null
@@ -37,8 +37,8 @@ export class HttpPermissions implements PermissionsAdapter {
     }
   }
 
-  async grant(key: string) {
-    const response = await this.request(this.endpoint, JSON.stringify({ resource_key: key, role: viewer }))
+  async grant(key: string, role = viewer) {
+    const response = await this.request(this.endpoint, JSON.stringify({ resource_key: key, role }))
     if (!response.ok) throw Error('Grant failed: HTTP ' + response.status)
   }
 }

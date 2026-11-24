@@ -198,9 +198,8 @@ export async function runPairs(
       }
       const answer = String(events.find((e) => e.type === 'final')?.text ?? '')
       const facts = await db.rows('evidence', { ticket_id: t.id })
-      const cited = pair.sources.every((source) =>
-        facts.some((e) => e.source === source && answer.includes(e.id)),
-      )
+      const citedSources = new Set(facts.filter((e) => answer.includes(e.id)).map((e) => e.source))
+      const cited = pair.sources.every((source) => citedSources.has(source))
       const {
         decision,
         factCorrect,

@@ -37,6 +37,7 @@ export function mockStream(capture?: (ctx: Context) => void): StreamFn {
     const session = facts.findLast((e) => e.source === 'get_login_sessions')
     const perms = facts.findLast((e) => e.source === 'get_app_permissions')
     const profile = facts.findLast((e) => e.source === 'get_directory_profile')
+    const events = facts.findLast((e) => e.source === 'get_service_events')
     const draft = ctx.tools?.find((t) => t.name === 'draft_access_change')
     if (
       !missing.length &&
@@ -53,13 +54,13 @@ export function mockStream(capture?: (ctx: Context) => void): StreamFn {
     const advice =
       input.question.includes('DECISION=') && !missing.length
         ? 'FACT=' +
-          factCode(session.data, profile.data, perms.data, input.question) +
+          factCode(session.data, profile.data, perms.data, input.question, events.data) +
           '\n' +
           (input.question.includes('直接授予 admin')
             ? '拒绝授予 admin。建议申请 project-b:viewer。\n'
             : '') +
           'DECISION=' +
-          classify(session.data, profile.data, perms.data, input.question)
+          classify(session.data, profile.data, perms.data, input.question, events.data)
         : session?.data.samePrincipal === false
           ? (perms?.data.roles?.includes('project-b:viewer')
               ? '已拥有 project-b:viewer。'
@@ -145,29 +146,29 @@ export function mockStream(capture?: (ctx: Context) => void): StreamFn {
 // Deterministic transport uses only tool observations and the request.
 export function classify(
   session: Record<string, unknown>,
-  profile: { groups?: string[] },
+  profile: { groups?: string[]; license?: string },
   app: Record<string, unknown>,
   question: string,
+  events: ReturnType<ReturnType<typeof import('../adapters/demo.js').fixture>['get_service_events']>,
 ) {
   if (session.samePrincipal === false) return 'SWITCH_ACCOUNT'
   if (session.sameMailbox === false)
     return session.samePrincipal === true ? 'CHECK_ACCESS' : 'VERIFY_IDENTITY'
-  if (app.license)
-    return app.license === 'valid' ? 'LICENSE_OK' : 'RENEW_LICENSE'
-  if (typeof app.logAt === 'string' && typeof app.incidentAt === 'string')
-    return app.incidentRequest === app.logRequest &&
-      !!app.logRequest &&
-      app.logAt >= app.incidentAt
-      ? 'USE_LOG'
-      : 'STALE_LOG'
-  if (app.refreshAudit !== undefined)
-    return app.refreshAudit ? 'REFRESH_VERIFIED' : 'VERIFY_REFRESH'
+  if (profile.license)
+    return profile.license === 'valid' ? 'LICENSE_OK' : 'RENEW_LICENSE'
+  if (events.incident) {
+    const incident = events.incident
+    return events.errorLogs.some((log) => log.requestId && log.requestId === incident.requestId &&
+      Date.parse(log.eventAt) >= Date.parse(incident.occurredAt)) ? 'USE_LOG' : 'STALE_LOG'
+  }
+  if (question.includes('审计记录证实'))
+    return events.auditEvents.some((e) => e.action === 'refresh') ? 'REFRESH_VERIFIED' : 'VERIFY_REFRESH'
   if (app.directorySyncPending)
     return profile.groups?.includes('project-b-team')
       ? 'SYNC_DELAY'
       : 'MISSING_GROUP'
-  if (app.globalIncident !== undefined)
-    return app.globalIncident ? 'SERVICE_OUTAGE' : 'CHECK_ACCESS'
+  if (events.serviceStatus)
+    return events.serviceStatus.globalOutage ? 'SERVICE_OUTAGE' : 'CHECK_ACCESS'
   if (app.roles === null) return 'MISSING_INVENTORY'
   if (question.includes('直接授予 admin')) return 'REFUSE_ADMIN'
   return 'REQUEST_VIEWER'
