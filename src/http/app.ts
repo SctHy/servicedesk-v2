@@ -7,7 +7,11 @@ import { setTimeout as delay } from 'node:timers/promises'
 import type { StreamFn } from '@mariozechner/pi-agent-core'
 import type { Auth, Store, Run, Ticket, Event } from '../db/store.js'
 import { seed } from '../retrieval/lexical.js'
-import { investigate } from '../investigation/engine.js'
+import { Type } from 'typebox'
+import { fixture } from '../adapters/demo.js'
+import { appName, viewer } from '../changes/service.js'
+import type { Change } from '../changes/types.js'
+import { investigate, staleEvidence } from '../investigation/engine.js'
 
 const users = new Map<string, Auth>([
   [
@@ -35,7 +39,10 @@ export async function application(
   authenticate: (id: unknown) => Auth | undefined = demoAuth,
   permissions: PermissionsAdapter = new DemoPermissions(db),
 ) {
-  const app = Fastify({ bodyLimit: 32_768 })
+  const app = Fastify({
+    bodyLimit: 32_768,
+    ajv: { customOptions: { removeAdditional: false, coerceTypes: false } },
+  })
   await seed(db)
   // A single process owns every investigation. Close interrupted event streams
   // after a restart so reconnecting subscribers receive a terminal event.
@@ -80,32 +87,124 @@ export async function application(
   const timer = setInterval(wake, 1000)
   timer.unref()
   wake()
+  const idParams = Type.Object({ id: Type.String() })
+  const body = (fields: Parameters<typeof Type.Object>[0]) =>
+    Type.Object(fields, { additionalProperties: false })
+  const visible = (c: Change, a: Auth) =>
+    c.tenant_id === a.tenant_id &&
+    (privileged(a) ||
+      a.actor_id === c.requester_id ||
+      a.actor_id === c.beneficiary_principal)
+  const sessions = new Map<string, 'normal' | 'wrong_account'>()
+  const local = () => {
+    if (!(permissions instanceof DemoPermissions))
+      throw fail(404, 'Demo controls unavailable')
+    return permissions
+  }
   app.get('/api/changes', async (req) => {
     const a = owner(req.headers['x-demo-user'])
-    const changes = await db.rows('changes', { tenant_id: a.tenant_id })
-    return changes.filter(
-      (c) =>
-        privileged(a) ||
-        a.actor_id === c.requester_id ||
-        a.actor_id === c.beneficiary_principal,
+    return (await db.rows('changes', { tenant_id: a.tenant_id })).filter((c) =>
+      visible(c, a),
     )
   })
-  app.post<{ Body: { app: string; role: string; reason: string } }>(
+  app.get<{ Params: { id: string } }>(
+    '/api/changes/:id/audit',
+    { schema: { params: idParams } },
+    async (req) => {
+      const a = owner(req.headers['x-demo-user'])
+      if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(req.params.id))
+        throw fail(404, 'Unknown change')
+      const [c] = await db.rows('changes', {
+        id: req.params.id,
+        tenant_id: a.tenant_id,
+      })
+      if (!c || !visible(c, a)) throw fail(404, 'Unknown change')
+      return (await db.rows('change_audit', { change_id: c.id })).sort((a, b) =>
+        a.created_at.localeCompare(b.created_at),
+      )
+    },
+  )
+  app.post<{
+    Params: { id: string }
+    Body: { session: 'normal' | 'wrong_account' }
+  }>(
+    '/api/demo/tickets/:id/session',
+    {
+      schema: {
+        params: idParams,
+        body: body({
+          session: Type.Union([
+            Type.Literal('normal'),
+            Type.Literal('wrong_account'),
+          ]),
+        }),
+      },
+    },
+    async (req) => {
+      const t = await ticket(req.params.id, owner(req.headers['x-demo-user']))
+      local()
+      if (t.scenario !== 'B') throw fail(400, 'Scenario B required')
+      sessions.set(t.id, req.body.session)
+      return req.body
+    },
+  )
+  app.get('/api/demo/fault', async (req) => {
+    owner(req.headers['x-demo-user'])
+    return { fault: local().fault ?? 'none' }
+  })
+  app.post<{ Body: { fault: 'none' | 'unknown_external_state' } }>(
+    '/api/demo/fault',
+    {
+      schema: {
+        body: body({
+          fault: Type.Union([
+            Type.Literal('none'),
+            Type.Literal('unknown_external_state'),
+          ]),
+        }),
+      },
+    },
+    async (req) => {
+      const a = owner(req.headers['x-demo-user'])
+      if (a.tenant_id !== 'demo') throw fail(403, 'Demo tenant required')
+      local().fault = req.body.fault === 'none' ? undefined : req.body.fault
+      return req.body
+    },
+  )
+  app.post<{
+    Body: { app: string; role: string; reason: string; ttl_minutes?: number }
+  }>(
     '/api/changes',
+    {
+      schema: {
+        body: body({
+          app: Type.String(),
+          role: Type.String(),
+          reason: Type.String(),
+          ttl_minutes: Type.Optional(
+            Type.Number({ exclusiveMinimum: 0, maximum: 10080 }),
+          ),
+        }),
+      },
+    },
     async (req, reply) => {
       const a = owner(req.headers['x-demo-user'])
-      if (
-        Object.keys(req.body ?? {}).some(
-          (k) => !['app', 'role', 'reason'].includes(k),
-        )
-      )
-        throw fail(400, 'Unexpected field')
       return reply.code(201).send(await draft(db, a, req.body))
     },
   )
   for (const path of ['decision', 'resolve']) {
     app.post<{ Params: { id: string }; Body: Parameters<typeof decide>[3] }>(
       '/api/changes/:id/' + path,
+      {
+        schema: {
+          params: idParams,
+          body: body({
+            decision: Type.String(),
+            payload_hash: Type.Optional(Type.String()),
+            note: Type.Optional(Type.String()),
+          }),
+        },
+      },
       async (req) => {
         if (
           !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(req.params.id)
@@ -130,6 +229,13 @@ export async function application(
   ])
   app.post<{ Body: { scenario: Ticket['scenario'] } }>(
     '/api/tickets',
+    {
+      schema: {
+        body: body({
+          scenario: Type.Union([Type.Literal('A'), Type.Literal('B')]),
+        }),
+      },
+    },
     async (req, reply) => {
       const a = owner(req.headers['x-demo-user'])
       if (!['A', 'B'].includes(req.body?.scenario))
@@ -146,92 +252,141 @@ export async function application(
   app.get('/api/tickets', (req) =>
     db.rows('tickets', scope(owner(req.headers['x-demo-user']))),
   )
-  app.get<{ Params: { id: string } }>('/api/tickets/:id', async (req) => {
-    const t = await ticket(req.params.id, owner(req.headers['x-demo-user']))
-    return {
-      ...t,
-      evidence: await db.rows('evidence', { ticket_id: t.id }),
-      runs: (await db.rows('runs', { ticket_id: t.id })).sort((a, b) =>
-        a.created_at.localeCompare(b.created_at),
-      ),
-    }
-  })
+  app.get<{ Params: { id: string } }>(
+    '/api/tickets/:id',
+    { schema: { params: idParams } },
+    async (req) => {
+      const t = await ticket(req.params.id, owner(req.headers['x-demo-user']))
+      const changes = await db.rows('changes', {
+        tenant_id: t.tenant_id,
+        ticket_id: t.id,
+      })
+      return {
+        ...t,
+        changes,
+        session: sessions.get(t.id) ?? 'normal',
+        demo: permissions instanceof DemoPermissions,
+        evidence: (await db.rows('evidence', { ticket_id: t.id })).map((e) => ({
+          ...e,
+          stale: staleEvidence(e, changes),
+        })),
+        runs: (await db.rows('runs', { ticket_id: t.id })).sort((a, b) =>
+          a.created_at.localeCompare(b.created_at),
+        ),
+      }
+    },
+  )
   app.post<{
     Params: { id: string }
     Body: { message: string; client_request_id: string }
-  }>('/api/tickets/:id/runs', async (req, reply) => {
-    const a = owner(req.headers['x-demo-user']),
-      t = await ticket(req.params.id, a)
-    const { message, client_request_id } = req.body ?? {}
-    if (
-      typeof message !== 'string' ||
-      !message.trim() ||
-      typeof client_request_id !== 'string' ||
-      !client_request_id.trim()
-    )
-      throw fail(400, 'Missing message or client_request_id')
-    const filter = { ...scope(a), ticket_id: t.id, client_request_id }
-    const fingerprint = createHash('sha256').update(message).digest('hex')
-    const { run, created } = await db.locked('request:' + t.id, async (tx) => {
-      const [existing] = await tx.rows('runs', filter)
-      if (existing) {
-        if (existing.request_fingerprint !== fingerprint)
-          throw fail(409, 'Request content changed')
-        return { run: existing, created: false }
-      }
-      const run: Run = {
-        ...filter,
-        id: crypto.randomUUID(),
-        request_fingerprint: fingerprint,
-        created_at: new Date().toISOString(),
-      }
-      await tx.add('runs', run)
-      return { run, created: true }
-    })
-    if (created) {
-      let seq = 0
-      const emit = (data: Event['data']) =>
-        db.add('run_events', { run_id: run.id, seq: ++seq, data })
-      const task = (queues.get(t.id) ?? Promise.resolve())
-        .catch(() => {})
-        .then(async () => {
-          try {
-            await emit({ type: 'started' })
-            await investigate(
-              db,
-              a,
-              t,
-              message,
-              key,
-              emit,
-              transport,
-              undefined,
-              undefined,
-              true,
-              { signal: shutdown.signal },
-              permissions,
-            )
-          } catch (err) {
-            await emit({
-              type: 'error',
-              text:
-                err instanceof Error && err.name === 'TimeoutError'
-                  ? '调查超时，请重试。'
-                  : '调查中断，请发起新一轮调查。',
-            })
+  }>(
+    '/api/tickets/:id/runs',
+    {
+      schema: {
+        params: idParams,
+        body: body({
+          message: Type.String(),
+          client_request_id: Type.String(),
+        }),
+      },
+    },
+    async (req, reply) => {
+      const a = owner(req.headers['x-demo-user']),
+        t = await ticket(req.params.id, a)
+      const { message, client_request_id } = req.body ?? {}
+      if (
+        typeof message !== 'string' ||
+        !message.trim() ||
+        typeof client_request_id !== 'string' ||
+        !client_request_id.trim()
+      )
+        throw fail(400, 'Missing message or client_request_id')
+      const filter = { ...scope(a), ticket_id: t.id, client_request_id }
+      const fingerprint = createHash('sha256').update(message).digest('hex')
+      const { run, created } = await db.locked(
+        'request:' + t.id,
+        async (tx) => {
+          const [existing] = await tx.rows('runs', filter)
+          if (existing) {
+            if (existing.request_fingerprint !== fingerprint)
+              throw fail(409, 'Request content changed')
+            return { run: existing, created: false }
           }
-        })
-      queues.set(t.id, task)
-      void task
-        .finally(() => {
-          if (queues.get(t.id) === task) queues.delete(t.id)
-        })
-        .catch(() => {})
-    }
-    return reply.code(created ? 202 : 200).send({ runId: run.id })
-  })
+          const run: Run = {
+            ...filter,
+            id: crypto.randomUUID(),
+            request_fingerprint: fingerprint,
+            created_at: new Date().toISOString(),
+          }
+          await tx.add('runs', run)
+          return { run, created: true }
+        },
+      )
+      if (created) {
+        let seq = 0
+        const emit = (data: Event['data']) =>
+          db.add('run_events', { run_id: run.id, seq: ++seq, data })
+        const task = (queues.get(t.id) ?? Promise.resolve())
+          .catch(() => {})
+          .then(async () => {
+            try {
+              await emit({ type: 'started' })
+              let demoFixture
+              if (
+                t.scenario === 'B' &&
+                permissions instanceof DemoPermissions
+              ) {
+                const wrong = sessions.get(t.id) === 'wrong_account'
+                const granted = await permissions.read(
+                  JSON.stringify([a.tenant_id, appName, 'bob']),
+                  viewer,
+                )
+                demoFixture = fixture('B', {
+                  webStatus: granted ? 200 : 403,
+                  desktopStatus: !wrong && granted ? 200 : 403,
+                  ...(wrong && {
+                    principal: 'external-71',
+                    sessionEmail: 'other@personal.example',
+                  }),
+                })
+              }
+              await investigate(
+                db,
+                a,
+                t,
+                message,
+                key,
+                emit,
+                transport,
+                demoFixture,
+                undefined,
+                true,
+                { signal: shutdown.signal },
+                permissions,
+              )
+            } catch (err) {
+              await emit({
+                type: 'error',
+                text:
+                  err instanceof Error && err.name === 'TimeoutError'
+                    ? '调查超时，请重试。'
+                    : '调查中断，请发起新一轮调查。',
+              })
+            }
+          })
+        queues.set(t.id, task)
+        void task
+          .finally(() => {
+            if (queues.get(t.id) === task) queues.delete(t.id)
+          })
+          .catch(() => {})
+      }
+      return reply.code(created ? 202 : 200).send({ runId: run.id })
+    },
+  )
   app.get<{ Params: { runId: string } }>(
     '/api/runs/:runId/events',
+    { schema: { params: Type.Object({ runId: Type.String() }) } },
     async (req, reply) => {
       const a = owner(req.headers['x-demo-user']),
         id = req.params.runId

@@ -65,12 +65,18 @@ type Tables = {
     cipher: string
   }
 }
+type WithDefaults<Row, Keys extends keyof Row> = Omit<Row, Keys> & Partial<Pick<Row, Keys>>
+type Inserts = Omit<Tables, 'changes' | 'jobs'> & {
+  changes: WithDefaults<Change, 'expires_at' | 'revoked_at'>
+  jobs: WithDefaults<Job, 'kind' | 'run_at'>
+}
 export interface Store {
+  removeGrant(key: string, role: string): Promise<void>
   rows<K extends keyof Tables>(
     table: K,
     filter: Partial<Tables[K]>,
   ): Promise<Tables[K][]>
-  add<K extends keyof Tables>(table: K, row: Tables[K]): Promise<void>
+  add<K extends keyof Tables>(table: K, row: Inserts[K]): Promise<void>
   update<K extends keyof Tables>(
     table: K,
     filter: Partial<Tables[K]>,
@@ -79,6 +85,10 @@ export interface Store {
   locked<T>(key: string, work: (db: Store) => Promise<T>): Promise<T>
 }
 export class MemoryStore implements Store {
+  async removeGrant(key: string, role: string) {
+    this.tables.set('demo_grants', (this.tables.get('demo_grants') ?? []).filter(
+      row => Reflect.get(row, 'resource_key') !== key || Reflect.get(row, 'role') !== role))
+  }
   private tables = new Map<string, object[]>()
   private locks = new Map<string, Promise<unknown>>()
   async rows<K extends keyof Tables>(table: K, filter: Partial<Tables[K]>) {
@@ -88,9 +98,11 @@ export class MemoryStore implements Store {
       ),
     ) as Tables[K][]
   }
-  async add<K extends keyof Tables>(table: K, row: Tables[K]) {
+  async add<K extends keyof Tables>(table: K, row: Inserts[K]) {
     const rows = this.tables.get(table) ?? []
-    rows.push(structuredClone(row))
+    const defaults = table === 'jobs' ? { kind: 'grant', run_at: new Date().toISOString() }
+      : table === 'changes' ? { expires_at: null, revoked_at: null } : {}
+    rows.push(structuredClone({ ...defaults, ...row }))
     this.tables.set(table, rows)
   }
   async update<K extends keyof Tables>(
@@ -112,6 +124,10 @@ export class MemoryStore implements Store {
         staged.tables = structuredClone(this.tables)
         const commits: (() => void)[] = []
         const tx: Store = {
+          removeGrant: async (key, role) => {
+            await staged.removeGrant(key, role)
+            commits.push(() => { void this.removeGrant(key, role) })
+          },
           rows: staged.rows.bind(staged),
           add: async (table, row) => {
             await staged.add(table, row)
@@ -145,6 +161,9 @@ export class PgStore implements Store {
     readonly pool: pg.Pool,
     private client?: pg.PoolClient,
   ) {}
+  async removeGrant(key: string, role: string) {
+    await this.sql.query('DELETE FROM demo_grants WHERE resource_key=$1 AND role=$2', [key, role])
+  }
   private get sql() {
     return this.client ?? this.pool
   }
@@ -161,7 +180,7 @@ export class PgStore implements Store {
     )
     return JSON.parse(JSON.stringify(result.rows)) as Tables[K][]
   }
-  async add<K extends keyof Tables>(table: K, row: Tables[K]) {
+  async add<K extends keyof Tables>(table: K, row: Inserts[K]) {
     const fields = Object.keys(row)
     await this.sql.query(
       'INSERT INTO ' +
@@ -245,6 +264,10 @@ export class PgStore implements Store {
           ),
         )
         await conn.query('INSERT INTO schema_migrations VALUES(2)')
+      }
+      if (!(await conn.query('SELECT 1 FROM schema_migrations WHERE version=3')).rowCount) {
+        await conn.query(await readFile(new URL('./migrations/003_m4_expiry.sql', import.meta.url), 'utf8'))
+        await conn.query('INSERT INTO schema_migrations VALUES(3)')
       }
     })
   }

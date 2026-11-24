@@ -3,6 +3,7 @@ export type Observations = {
   principal?: string | null
   sessionEmail?: string
   license?: 'valid' | 'expired'
+  webStatus?: number
   desktopStatus?: number
   incidentRequest?: string
   logRequest?: string
@@ -52,7 +53,7 @@ export function fixture(
           email: session.email,
           status: observations.desktopStatus ?? 403,
         },
-        web: { email, status: scenario === 'A' ? 200 : 403 },
+        web: { email, status: observations.webStatus ?? (scenario === 'A' ? 200 : 403) },
         ...compare(
           email,
           session.email,

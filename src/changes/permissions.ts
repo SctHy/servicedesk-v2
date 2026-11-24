@@ -2,6 +2,7 @@ import { viewer } from './service.js'
 
 export interface PermissionsAdapter {
   read(key: string, role?: string): Promise<boolean | null>
+  revoke(key: string, role?: string): Promise<void>
   grant(key: string, role?: string): Promise<void>
 }
 
@@ -13,9 +14,9 @@ export class HttpPermissions implements PermissionsAdapter {
       throw Error('Invalid PERMISSIONS_TIMEOUT_MS')
   }
 
-  private request(url: string, body?: string) {
+  private request(url: string, body?: string, method = body === undefined ? 'GET' : 'POST') {
     return fetch(url, {
-      method: body === undefined ? 'GET' : 'POST',
+      method,
       headers: {
         ...(this.token && { Authorization: 'Bearer ' + this.token }),
         ...(body && { 'Content-Type': 'application/json' }),
@@ -35,6 +36,11 @@ export class HttpPermissions implements PermissionsAdapter {
     } catch {
       return null
     }
+  }
+
+  async revoke(key: string, role = viewer) {
+    const response = await this.request(this.endpoint + '?' + new URLSearchParams({ resource_key: key, role }), undefined, 'DELETE')
+    if (!response.ok) throw Error('Revoke failed: HTTP ' + response.status)
   }
 
   async grant(key: string, role = viewer) {

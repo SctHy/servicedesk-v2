@@ -12,11 +12,14 @@ export type Change = {
   status:
     | 'pending_approval'
     | 'approved'
+    | 'revoked'
     | 'rejected'
     | 'executing'
     | 'succeeded'
     | 'failed'
     | 'manual_review'
+  expires_at: string | null
+  revoked_at: string | null
   approver_id: string | null
   decision_note: string | null
   created_at: string
@@ -26,6 +29,8 @@ export type Job = {
   id: string
   tenant_id: string
   change_id: string
+  kind: 'grant' | 'revoke'
+  run_at: string
   resource_key: string
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'manual_review'
   version: number

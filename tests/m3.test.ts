@@ -29,6 +29,11 @@ function permissionServer(mode: 'ok' | 'write-error' | 'unknown' | 'hold' = 'ok'
       if (req.method === 'GET')
         return mode === 'unknown' ? new Response(null, { status: 503 }) :
           Response.json({ granted: grants.has(url.searchParams.get('resource_key')!) })
+      if (req.method === 'DELETE') {
+        if (url.searchParams.get('role') !== viewer) return new Response(null, { status: 400 })
+        grants.delete(url.searchParams.get('resource_key')!)
+        return new Response(null, { status: mode === 'write-error' ? 503 : 204 })
+      }
       const body = await req.json()
       if (req.method !== 'POST' || body.role !== viewer || typeof body.resource_key !== 'string')
         return new Response(null, { status: 400 })
@@ -87,6 +92,90 @@ for (const pgMode of [false, true]) {
         })
         return (await db.rows('jobs', { change_id: c.id }))[0]
       }
+      for (const overlap of [false, true]) {
+        it('recovers expired access with overlap=' + overlap, async () => {
+          const adapter = new DemoPermissions(db)
+          const executor = new Executor(db, adapter)
+          if (overlap) {
+            await queue('长期授权')
+            await executor.run()
+          }
+          const c = await draft(db, bob, { ...input, ttl_minutes: 0.01 })
+          await decide(db, carol, c.id, { decision: 'approve', payload_hash: c.payload_hash })
+          await executor.run()
+          const [job] = await db.rows('jobs', { change_id: c.id, kind: 'revoke' })
+          expect(job.run_at).toBe(c.expires_at!)
+          await executor.step(job)
+          expect((await db.rows('changes', { id: c.id }))[0].status).toBe('succeeded')
+          await Bun.sleep(Math.max(0, Date.parse(job.run_at) - Date.now() + 5))
+          await Promise.all([executor.run(), new Executor(db, adapter).run()])
+          expect((await db.rows('changes', { id: c.id }))[0].revoked_at).toBeTruthy()
+          expect(await adapter.read(job.resource_key)).toBe(overlap)
+          expect(adapter.revokes).toBe(overlap ? 0 : 1)
+          expect(await db.rows('change_audit', { change_id: c.id, actor_id: 'system', action: 'revoked' })).toHaveLength(1)
+        })
+      }
+      it('reads back an ambiguous HTTP revoke and avoids a second delete', async () => {
+        http = permissionServer('write-error')
+        const c = await draft(db, bob, { ...input, ttl_minutes: 0.01 })
+        await decide(db, carol, c.id, { decision: 'approve', payload_hash: c.payload_hash })
+        const executor = new Executor(db, http.adapter)
+        await executor.run()
+        await Bun.sleep(Math.max(0, Date.parse(c.expires_at!) - Date.now() + 5))
+        await executor.run()
+        await executor.run()
+        expect(http.methods).toEqual(['GET','POST','GET','GET','DELETE','GET'])
+        expect((await db.rows('changes', {id: c.id}))[0].status).toBe('revoked')
+      })
+      it('requires evidence to close an unknown revoke and records the recovery time', async () => {
+        const c = await draft(db, bob, { ...input, ttl_minutes: 0.01 })
+        await decide(db, carol, c.id, { decision: 'approve', payload_hash: c.payload_hash })
+        const adapter = new DemoPermissions(db)
+        const executor = new Executor(db, adapter)
+        await executor.run()
+        await Bun.sleep(Math.max(0, Date.parse(c.expires_at!) - Date.now() + 5))
+        adapter.fault = 'unknown_external_state'
+        await executor.run()
+        expect(adapter.revokes).toBe(0)
+        expect((await db.rows('changes', {id:c.id}))[0].status).toBe('manual_review')
+        const [job] = await db.rows('jobs', {change_id:c.id, kind:'revoke'})
+        adapter.fault = undefined
+        await adapter.revoke(job.resource_key)
+        await decide(db, carol, c.id, {decision:'succeeded',payload_hash:c.payload_hash,note:'核对外部角色已移除'},true)
+        expect((await db.rows('changes', {id:c.id}))[0].revoked_at).toBeTruthy()
+      })
+      it('isolates audit and exercises account drift through the HTTP controls', async () => {
+        const app = await application(db, randomBytes(32), mockStream())
+        const request = (url: string, user: string, payload?: object) => app.inject({
+          method: payload ? 'POST' : 'GET', url, headers: { 'x-demo-user': user }, payload,
+        })
+        try {
+          const j = await queue()
+          const audit = '/api/changes/' + j.change_id + '/audit'
+          for (const user of ['bob','carol']) expect((await request(audit,user)).statusCode).toBe(200)
+          for (const user of ['alice','guest']) expect((await request(audit,user)).statusCode).toBe(404)
+          expect((await request(audit,'unknown')).statusCode).toBe(401)
+          const t = (await request('/api/tickets','bob',{scenario:'B'})).json()
+          const path = '/api/demo/tickets/' + t.id + '/session'
+          expect((await request(path,'alice',{session:'wrong_account'})).statusCode).toBe(404)
+          for (const session of ['wrong_account','normal']) {
+            expect((await request(path,'bob',{session})).statusCode).toBe(200)
+            const run = (await request('/api/tickets/'+t.id+'/runs','bob',{
+              message:'重新检查',client_request_id:session,
+            })).json()
+            await request('/api/runs/'+run.runId+'/events','bob')
+            const detail = (await request('/api/tickets/'+t.id,'bob')).json()
+            const observations = detail.evidence.filter((e: {source:string})=>e.source==='get_login_sessions')
+              .sort((a:{observed_at:string},b:{observed_at:string})=>a.observed_at.localeCompare(b.observed_at))
+            expect(observations.at(-1).data.samePrincipal).toBe(session==='normal')
+          }
+          expect((await request('/api/demo/fault','guest',{fault:'unknown_external_state'})).statusCode).toBe(403)
+          expect((await request('/api/demo/fault','carol',{fault:'unknown_external_state'})).statusCode).toBe(200)
+          expect((await request('/api/demo/fault','bob')).json().fault).toBe('unknown_external_state')
+        } finally {
+          await app.close()
+        }
+      })
       it('scopes evidence, approvals and ordinary access through HTTP', async () => {
         const app = await application(db, randomBytes(32), mockStream())
         const post = (url: string, payload: object, user = 'bob') =>
@@ -305,12 +394,14 @@ for (const pgMode of [false, true]) {
       it('rolls back approval and queue insertion if audit persistence fails', async () => {
         const c = await draft(db, bob, input)
         const failing: Store = {
+          removeGrant: db.removeGrant.bind(db),
           rows: db.rows.bind(db),
           add: db.add.bind(db),
           update: db.update.bind(db),
           locked: (key, fn) =>
             db.locked(key, (tx) =>
               fn({
+                removeGrant: tx.removeGrant.bind(tx),
                 rows: tx.rows.bind(tx),
                 update: tx.update.bind(tx),
                 locked: tx.locked.bind(tx),

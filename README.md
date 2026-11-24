@@ -1,6 +1,14 @@
 # ServiceDesk v2
 
-单进程 Fastify 服务提供 React 界面、只读调查工具和 SSE。默认使用内存存储和确定性 Pi 模型，无需凭据。演示身份由请求头选择，服务默认仅监听本机。
+面向 IT 服务台的最小权限调查工作台。它把一次「桌面 403」转成可复核的证据链，再由独立审批人确认权限变更。模型通过脱敏网关读取观测并起草，执行器负责授权、到期回收和审计。默认使用内存和 Mock，无需凭据。
+
+| 实测范围 | 结果 |
+|---|---|
+| 启用 PostgreSQL 的全量测试（含 Memory 对照） | 52 项通过，含真实 SIGKILL 后租约接管 |
+| gpt-6.2-sol 历史配对实测 | 16/16，8 对全部通过 |
+| gpt-6.2-sol 历史动态工作流 | 五项 × 三轮，15/15，pass^3 = 100% |
+
+[系统架构与排错复盘](docs/architecture.md) · [模型实测报告与逐例账本](docs/model-eval-report.md)
 
 ## 快速启动
 
@@ -12,7 +20,14 @@ bun run web:build
 bun run start
 ```
 
-在浏览器打开 http://127.0.0.1:3000 。选择案例后点击「创建并调查」。案例 A 应建议切换桌面账号。案例 B 将取证并起草项目只读权限变更。切换至 carol 审批后，执行器写入授权，回到原工单复查即可看到引用新证据的结果。展开证据可查看观测时间、身份比对和证据编号。输入追问可复用已保存的证据。切换账号可验证工单隔离。内存模式重启即清空。
+## 浏览器三分钟演示
+
+打开 http://127.0.0.1:3000 ，使用本地 Demo 权限服务和默认 Mock。内存模式重启会清空记录。
+
+1. 选 bob，新建案例 B，点击「创建并调查」。展开会话证据的身份比对、原始 JSON 和模型出站摘要。右栏出现项目 B 只读权限草案。
+2. 切到 carol，展开冻结哈希与证据后批准。切回 bob，打开原工单并追问「重新检查是否生效」。旧清单显示为历史观测。切换「模拟桌面登错账号 403」，追问「切换账号后重新检查」；切回正常项目账号后再次复查。
+3. 选 alice，手动申请 **1 分钟**只读权限，carol 批准。有效期从起草时开始；到期后展开审计轨迹，查看 system 的 revoked、到期时间和回收时间。独立使用 alice 可观察最后一份有效授权被撤销。
+4. 等待期间，用 bob 再提交一份申请，切换「模拟 503」并由 carol 批准，状态进入 manual_review。恢复正常后，在 bob 工单复查实际角色；carol 根据核对结果填写依据并结案。切换 guest 验证租户隔离。
 
 ## PostgreSQL 与可选模型
 
@@ -32,10 +47,13 @@ GET /healthz 与 GET /api/demo/scenarios 公开。其余接口传 x-demo-user（
 |---|---|
 | POST /api/tickets | JSON 字段 scenario 取 A 或 B |
 | GET /api/tickets | 当前用户的工单 |
-| GET /api/tickets/:id | 工单、证据、调查轮次 |
+| GET /api/tickets/:id | 工单、带 stale 标志的证据、变更、调查轮次 |
 | POST /api/tickets/:id/runs | JSON 字段 message 与 client_request_id。同键同内容返回原 runId，内容冲突返回 409 |
 | GET /api/changes | 申请人查看自己的变更，审批人查看本租户变更 |
-| POST /api/changes | 起草最小权限申请 |
+| POST /api/changes | app、role、reason，可选 ttl_minutes（大于 0，最多 10080）；省略为长期 |
+| GET /api/changes/:id/audit | 同租户申请人、受益人和审批人可读取按时间升序的审计轨迹 |
+| POST /api/demo/tickets/:id/session | 自己的案例 B，session 为 normal 或 wrong_account |
+| GET /api/demo/fault、POST /api/demo/fault | 查看故障状态；demo 租户可设置 fault 为 none 或 unknown_external_state |
 | POST /api/changes/:id/decision | carol 提交 decision、payload_hash，可附 note；禁止自审 |
 | POST /api/changes/:id/resolve | 有权限的审核人提交核对结果、payload_hash 和 note |
 | GET /api/runs/:runId/events | SSE，支持 Last-Event-ID。关闭订阅后调查继续 |
@@ -87,6 +105,7 @@ LIVE_MODEL=1 WORKFLOW_RUNS=3 bun run eval:workflow > eval-output/gpt-workflow-v3
 默认使用 DemoPermissions。设置 `PERMISSIONS_API_URL` 后，执行器和同工单复查共用该服务。可选 `PERMISSIONS_API_TOKEN` 用于 Bearer 认证，`PERMISSIONS_TIMEOUT_MS` 默认 3000 毫秒。
 
 - `GET /grants?resource_key=<URL 编码的资源键>&role=<URL 编码的角色>` 应返回 HTTP 200 和 `{"granted":true}` 或 `{"granted":false}`。读取失败表示状态未知，执行器转入人工核对。
+- `DELETE /grants?resource_key=…&role=…` 按 URL 编码的资源键和角色撤销，成功返回 2xx。执行器读回确认，结果未知则进入人工核对。
 - `POST /grants` 接收 `{"resource_key":"…","role":"project-b:viewer"}`，成功返回 2xx。即使写请求报错，执行器也会重新读取权限确认结果。
 
 设置 `TEST_DATABASE_URL` 后运行 `bun test`，PostgreSQL 套件会在 HTTP 服务完成授权、响应仍挂起时对一次性 worker 发送 SIGKILL，再启动第二个 worker 接管过期租约，验证全程只写入一次。

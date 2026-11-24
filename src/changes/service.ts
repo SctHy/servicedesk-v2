@@ -24,7 +24,7 @@ export function resource(c: Change) {
 export async function draft(
   db: Store,
   a: Auth,
-  input: { app: unknown; role: unknown; reason: unknown },
+  input: { app: unknown; role: unknown; reason: unknown; ttl_minutes?: number },
   context?: { ticket: Ticket; beneficiary: string; evidence: Evidence[] },
 ) {
   const policy = grantPolicies.find((p) => p.app === input?.app && p.role === input?.role)
@@ -49,6 +49,10 @@ export async function draft(
       }))
   )
     throw error(403, 'Missing supporting evidence')
+  const ttl = input.ttl_minutes
+  if (ttl !== undefined && (!Number.isFinite(ttl) || ttl <= 0 || ttl > 10080))
+    throw error(400, 'Invalid ttl_minutes')
+  const expires_at = ttl === undefined ? null : new Date(Date.now() + ttl * 60000).toISOString()
   const payload = {
     tenant_id: a.tenant_id,
     ticket_id: context?.ticket.id ?? null,
@@ -60,7 +64,7 @@ export async function draft(
     evidence_ids: (context?.evidence ?? []).map((e) => e.id).sort(),
   }
   const hash = createHash('sha256')
-    .update(JSON.stringify(payload))
+    .update(JSON.stringify(expires_at ? { ...payload, expires_at } : payload))
     .digest('hex')
   return db.locked('draft:' + hash, async (tx) => {
     const [existing] = await tx.rows('changes', {
@@ -70,6 +74,8 @@ export async function draft(
     if (existing) return existing
     const c: Change = {
       ...payload,
+      expires_at,
+      revoked_at: null,
       id: crypto.randomUUID(),
       payload_hash: hash,
       status: 'pending_approval',
@@ -79,8 +85,30 @@ export async function draft(
       updated_at: now(),
     }
     await tx.add('changes', c)
+    await tx.add('change_audit', { id: crypto.randomUUID(), change_id: c.id,
+      actor_id: a.actor_id, action: c.status, note: '', created_at: c.created_at })
     return c
   })
+}
+export async function enqueue(tx: Store, c: Change, kind: Job['kind']) {
+  if ((await tx.rows('jobs', { change_id: c.id, kind })).length) return
+  const job: Job = {
+    id: crypto.randomUUID(),
+    tenant_id: c.tenant_id,
+    change_id: c.id,
+    kind,
+    run_at: kind === 'grant' ? now() : c.expires_at!,
+    resource_key: resource(c),
+    status: 'queued',
+    lease_owner: null,
+    lease_until: null,
+    version: 0,
+    attempt_count: 0,
+    last_error: null,
+    created_at: now(),
+    updated_at: now(),
+  }
+  await tx.add('jobs', job)
 }
 export async function decide(
   db: Store,
@@ -133,30 +161,21 @@ export async function decide(
         )) !== 1
       )
         throw error(409, 'Stale job')
+      if (status === 'succeeded') {
+        if (j.kind === 'revoke') status = 'revoked'
+        else if (c.expires_at) await enqueue(tx, c, 'revoke')
+      }
     } else {
       if (decision !== 'approve' && decision !== 'reject')
         throw error(400, 'Invalid decision')
       status = decision === 'approve' ? 'approved' : 'rejected'
       if (status === 'approved') {
-        const job: Job = {
-          id: crypto.randomUUID(),
-          tenant_id: c.tenant_id,
-          change_id: id,
-          resource_key: resource(c),
-          status: 'queued',
-          lease_owner: null,
-          lease_until: null,
-          version: 0,
-          attempt_count: 0,
-          last_error: null,
-          created_at: now(),
-          updated_at: now(),
-        }
-        await tx.add('jobs', job)
+        await enqueue(tx, c, 'grant')
       }
     }
     await tx.update('changes', filter, {
       status,
+      ...(status === 'revoked' && { revoked_at: now() }),
       ...(resolve ? {} : { approver_id: a.actor_id, decision_note: note }),
       updated_at: now(),
     })
