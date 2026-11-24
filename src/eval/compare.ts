@@ -20,12 +20,12 @@ const models = ['', 'COMPARE_'].map(configuration)
 const runs = await Promise.all(
   models.map(async (settings) => ({
     model: settings.id,
-    reasoning: settings.reasoning,
+    reasoning: settings.reasoning ?? 'off',
     ...(await runPairs(true, undefined, settings)),
   })),
 )
 await mkdir('eval-output', { recursive: true })
-const target = 'eval-output/compare-live.json'
+const target = 'eval-output/compare-live-v2.json'
 const temporary = target + '.' + crypto.randomUUID()
 await writeFile(temporary, JSON.stringify(runs, null, 2))
 await rename(temporary, target)

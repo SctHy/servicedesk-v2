@@ -3,6 +3,9 @@ export type Observations = {
   principal?: string | null
   sessionEmail?: string
   license?: 'valid' | 'expired'
+  desktopStatus?: number
+  incidentRequest?: string
+  logRequest?: string
   incidentAt?: string
   logAt?: string
   refreshAudit?: boolean
@@ -44,7 +47,10 @@ export function fixture(
     get_login_sessions(value: string) {
       check(value)
       return {
-        desktop: { email: session.email, status: 403 },
+        desktop: {
+          email: session.email,
+          status: observations.desktopStatus ?? 403,
+        },
         web: { email, status: scenario === 'A' ? 200 : 403 },
         ...compare(
           email,
@@ -60,7 +66,13 @@ export function fixture(
         app: 'project-b-app',
         ...Object.fromEntries(
           Object.entries(observations).filter(
-            ([k]) => !['principal', 'sessionEmail', 'member'].includes(k),
+            ([k]) =>
+              ![
+                'principal',
+                'sessionEmail',
+                'member',
+                'desktopStatus',
+              ].includes(k),
           ),
         ),
         ...(observations.member === undefined

@@ -5,6 +5,8 @@ import { MemoryStore, PgStore, type Store, type Auth } from '../src/db/store'
 import { application } from '../src/http/app'
 import { mockStream } from '../src/investigation/mock'
 import { Executor, DemoPermissions } from '../src/changes/executor'
+import { investigate } from '../src/investigation/engine'
+import { fixture, type Observations } from '../src/adapters/demo'
 import { draft, decide, viewer, appName } from '../src/changes/service'
 
 const bob: Auth = { actor_id: 'bob', tenant_id: 'demo', department_id: 'it' }
@@ -126,6 +128,82 @@ for (const pgMode of [false, true]) {
           await app.close()
         }
       })
+      it('rechecks a successful change and follows desktop account changes on one ticket', async () => {
+        const ticket = {
+          actor_id: bob.actor_id,
+          tenant_id: bob.tenant_id,
+          id: crypto.randomUUID(),
+          scenario: 'B' as const,
+        }
+        await db.add('tickets', ticket)
+        const key = randomBytes(32)
+        const run = async (question: string, state: Observations = {}) => {
+          const events: { type: string; [key: string]: unknown }[] = []
+          let leaked = false
+          const result = await investigate(
+            db,
+            bob,
+            ticket,
+            question,
+            key,
+            async (e) => {
+              events.push(e)
+            },
+            mockStream((ctx) => {
+              leaked ||= /corp\.example|EMP-102|probeOnly/i.test(
+                JSON.stringify(ctx),
+              )
+            }),
+            fixture('B', state),
+            undefined,
+            true,
+            { timeoutMs: 3000 },
+          )
+          expect(leaked).toBe(false)
+          expect(result.toolFailures).toBe(0)
+          expect(result.toolAttempts).toBeLessThanOrEqual(5)
+          const answer = String(events.at(-1)?.text)
+          for (const source of ['get_app_permissions', 'get_login_sessions']) {
+            const fresh = events.find(
+              (e) => e.type === 'evidence' && e.source === source,
+            )
+            expect(fresh).toBeDefined()
+            expect(answer).toContain(String(fresh!.evidenceId))
+          }
+          return answer
+        }
+        await run('调查 403 password=probeOnly')
+        const [change] = await db.rows('changes', { ticket_id: ticket.id })
+        await decide(db, carol, change.id, {
+          decision: 'approve',
+          payload_hash: change.payload_hash,
+        })
+        const permissions = new DemoPermissions(db)
+        const executor = new Executor(db, permissions)
+        await executor.run()
+        expect((await db.rows('changes', { id: change.id }))[0].status).toBe(
+          'succeeded',
+        )
+        expect(await run('现在呢？')).toContain('权限已生效')
+        const wrong = await run('权限已经批了但还是 403', {
+          principal: 'external',
+          sessionEmail: 'alias@corp.example',
+        })
+        expect(wrong).toContain('登错账号')
+        expect(wrong).toContain('已拥有 project-b:viewer')
+        expect(
+          await run('切换回正确账号后重新检查', { desktopStatus: 200 }),
+        ).toContain('访问已恢复')
+        await executor.run()
+        expect(await db.rows('changes', { ticket_id: ticket.id })).toHaveLength(
+          1,
+        )
+        expect(await db.rows('jobs', { change_id: change.id })).toHaveLength(1)
+        expect(await db.rows('demo_grants', {})).toMatchObject([
+          { role: viewer },
+        ])
+        expect(permissions.writes).toBe(1)
+      })
       it('blocks both reviewer conflicts even with approval authority', async () => {
         const c = await draft(db, carol, input)
         await expect(
@@ -243,3 +321,60 @@ for (const pgMode of [false, true]) {
     },
   )
 }
+
+it('ends slow runs on deadline and shutdown, releasing the ticket queue', async () => {
+  const previous = process.env.INVESTIGATION_TIMEOUT_MS
+  process.env.INVESTIGATION_TIMEOUT_MS = '100'
+  const db = new MemoryStore()
+  let slow = true
+  let started!: () => void
+  let modelStarted = new Promise<void>((resolve) => {
+    started = resolve
+  })
+  const app = await application(db, randomBytes(32), async (...args) => {
+    if (slow) {
+      slow = false
+      started()
+      // Even a transport that ignores cancellation cannot hold the queue.
+      return new Promise<never>(() => {})
+    }
+    return mockStream()(...args)
+  })
+  const headers = { 'x-demo-user': 'bob' }
+  const post = (url: string, payload: object) =>
+    app.inject({ method: 'POST', url, headers, payload })
+  try {
+    const ticket = (await post('/api/tickets', { scenario: 'B' })).json()
+    const run = async (id: string) =>
+      (
+        await post('/api/tickets/' + ticket.id + '/runs', {
+          message: '调查',
+          client_request_id: id,
+        })
+      ).json().runId
+    const first = await run('slow')
+    await modelStarted
+    const next = await run('next')
+    await app.inject({ url: '/api/runs/' + next + '/events', headers })
+    const terminal = async (id: string) =>
+      (await db.rows('run_events', { run_id: id })).at(-1)!.data
+    expect(await terminal(first)).toMatchObject({
+      type: 'error',
+      text: expect.stringContaining('超时'),
+    })
+    expect(await terminal(next)).toMatchObject({ type: 'final' })
+    process.env.INVESTIGATION_TIMEOUT_MS = '60000'
+    slow = true
+    modelStarted = new Promise((resolve) => {
+      started = resolve
+    })
+    const closing = await run('closing')
+    await modelStarted
+    await app.close()
+    expect(await terminal(closing)).toMatchObject({ type: 'error' })
+  } finally {
+    if (previous === undefined) delete process.env.INVESTIGATION_TIMEOUT_MS
+    else process.env.INVESTIGATION_TIMEOUT_MS = previous
+    await app.close()
+  }
+})

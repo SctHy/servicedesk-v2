@@ -18,12 +18,12 @@ export class Rules implements EntityDetector {
     match(/(?<![\w-])(?:\+?86[- ]?)?1[3-9]\d{9}(?![\w-])/g, 'PHONE')
     match(/(?<!\[)\bEMP[-_]?\d+\b/gi, 'EMP')
     match(
-      /["'](?:secret|password|api[_-]?key|token|authorization)["']\s*:\s*"(?:\\.|[^"\\])*"/gi,
+      /["'](?:secret|password|passwd|api[_-]?key|token|authorization)["']\s*:\s*"(?:\\.|[^"\\])*"/gi,
       'SECRET',
     )
     match(/\b(?:sk-|ghp_)[\w-]{8,}/g, 'SECRET')
     match(
-      /(?:authorization\s*:\s*(?:bearer\s+)?|bearer\s+|(?:token|api[_-]?key)\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"',;，；。}]+)/gi,
+      /(?:authorization\s*:\s*(?:bearer\s+)?|bearer\s+|(?:\b(?:password|passwd|secret|token|api[_-]?key)["']?\s*[:=]|(?:密码|口令|密钥)\s*(?:是|为|[:：=]))\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"',;，；。}]+)/gi,
       'SECRET',
     )
     // Weak credentials after explicit assignments are also sensitive. Entropy
@@ -183,7 +183,9 @@ export class Vault {
     if (obj && typeof obj === 'object') {
       const out: Record<string, unknown> = Object.create(null)
       for (const [k, v] of Object.entries(obj)) {
-        if (/^(secret|password|api[_-]?key|authorization|token)$/i.test(k))
+        if (
+          /^(secret|password|passwd|api[_-]?key|authorization|token)$/i.test(k)
+        )
           continue
         if (
           field === 'diagnostic' &&
@@ -221,7 +223,11 @@ export class Vault {
         if (x && typeof x === 'object') {
           const out: Record<string, unknown> = Object.create(null)
           for (const [k, v] of Object.entries(x))
-            if (!/^(secret|password|authorization|api[_-]?key|token)$/i.test(k))
+            if (
+              !/^(secret|password|passwd|authorization|api[_-]?key|token)$/i.test(
+                k,
+              )
+            )
               out[await this.text(k)] = await scrub(v)
           return out
         }
@@ -253,6 +259,15 @@ export class Vault {
       return next(model, safe, {
         apiKey: options?.apiKey,
         signal: options?.signal,
+        reasoning: options?.reasoning,
+        thinkingBudgets: options?.thinkingBudgets,
+        temperature: options?.temperature,
+        maxTokens: options?.maxTokens,
+        cacheRetention: options?.cacheRetention,
+        transport: options?.transport,
+        timeoutMs: options?.timeoutMs,
+        maxRetries: options?.maxRetries,
+        maxRetryDelayMs: options?.maxRetryDelayMs,
       })
     }
   }

@@ -47,6 +47,8 @@ export async function application(
       })
     }
   }
+  const shutdown = new AbortController()
+  app.addHook('preClose', async () => shutdown.abort())
   const queues = new Map<string, Promise<void>>()
   const scope = (a: Auth) => ({ tenant_id: a.tenant_id, actor_id: a.actor_id })
   const fail = (statusCode: number, message: string) =>
@@ -204,9 +206,16 @@ export async function application(
               undefined,
               undefined,
               true,
+              { signal: shutdown.signal },
             )
-          } catch {
-            await emit({ type: 'error', text: '调查中断，请发起新一轮调查。' })
+          } catch (err) {
+            await emit({
+              type: 'error',
+              text:
+                err instanceof Error && err.name === 'TimeoutError'
+                  ? '调查超时，请重试。'
+                  : '调查中断，请发起新一轮调查。',
+            })
           }
         })
       queues.set(t.id, task)
