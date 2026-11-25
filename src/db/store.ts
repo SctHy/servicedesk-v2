@@ -20,6 +20,8 @@ export type Run = Pick<Ticket, 'tenant_id' | 'actor_id'> & {
   id: string
   ticket_id: string
   client_request_id: string
+  status: 'running' | 'completed' | 'failed'
+  lease_until: string | null
   request_fingerprint: string
   created_at: string
 }
@@ -70,7 +72,8 @@ export type Tables = {
 }
 type WithDefaults<Row, Keys extends keyof Row> = Omit<Row, Keys> &
   Partial<Pick<Row, Keys>>
-type Inserts = Omit<Tables, 'changes' | 'jobs'> & {
+type Inserts = Omit<Tables, 'runs' | 'changes' | 'jobs'> & {
+  runs: WithDefaults<Run, 'status' | 'lease_until'>
   changes: WithDefaults<Change, 'expires_at' | 'revoked_at'>
   jobs: WithDefaults<Job, 'kind' | 'run_at'>
 }
@@ -171,6 +174,7 @@ export class Store {
         '004_m5_indexes',
         '005_observability',
         '006_tenant_relations',
+        '007_multi_instance_runs',
       ]
       for (const [i, file] of files.entries()) {
         if (

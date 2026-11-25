@@ -67,16 +67,27 @@ export async function application(
   })
   const metrics = new Metrics()
   await seed(db)
-  // A single process owns every investigation. Close interrupted event streams
-  // after a restart so reconnecting subscribers receive a terminal event.
-  await db.query(
-    `INSERT INTO run_events(run_id, seq, data)
-    SELECT r.id, coalesce(max(e.seq),0)+1, $1::jsonb FROM runs r
-    LEFT JOIN run_events e ON e.run_id=r.id GROUP BY r.id
-    HAVING NOT coalesce(bool_or(e.data->>'type' IN ('final','error')),false)`,
-    [JSON.stringify({ type: 'error', text: '服务已重启，请发起新一轮调查。' })],
-  )
   const bus = events(db)
+  async function appendEvent(tx: Store, runId: string, data: Event['data']) {
+    // The caller holds the run row lock until the event and notification commit.
+    await tx.query(
+      'INSERT INTO run_events SELECT $1, coalesce(max(seq), 0)+1, $2::jsonb FROM run_events WHERE run_id=$1',
+      [runId, JSON.stringify(data)],
+    )
+    if (db instanceof PgStore)
+      await tx.query("SELECT pg_notify('desk_events', $1)", [JSON.stringify({ kind: 'run', runId })])
+  }
+  async function expireRuns(tx: Store, ticketId?: string) {
+    const expired = await tx.query<{ id: string }>(
+      `UPDATE runs SET status='failed', lease_until=NULL
+       WHERE status='running' AND (lease_until IS NULL OR lease_until <= now())
+       ${ticketId ? 'AND ticket_id=$1' : ''} RETURNING id`, ticketId ? [ticketId] : [],
+    )
+    for (const { id } of expired)
+      await appendEvent(tx, id, { type: 'error', text: '调查租约已过期，请发起新一轮调查。' })
+    return expired
+  }
+  for (const { id } of await db.tx(tx => expireRuns(tx))) bus.emit('run:' + id)
   const shutdown = new AbortController()
   app.addHook('preClose', async () => shutdown.abort())
   const queues = new Map<string, Promise<void>>()
@@ -335,90 +346,101 @@ export async function application(
         throw fail(400, 'Missing message or client_request_id')
       const filter = { ...scope(a), ticket_id: t.id, client_request_id }
       const fingerprint = createHash('sha256').update(message).digest('hex')
-      const { run, created } = await new TenantScope(db, a.tenant_id).locked(
-        'request:' + t.id,
-        async (tx) => {
-          const [existing] = await tx.rows('runs', filter)
-          if (existing) {
-            if (existing.request_fingerprint !== fingerprint) throw fail(409, 'Request content changed')
-            return { run: existing, created: false }
-          }
-          const run: Run = {
-            ...filter,
-            id: crypto.randomUUID(),
-            request_fingerprint: fingerprint,
-            created_at: new Date().toISOString(),
-          }
-          await tx.add('runs', run)
-          return { run, created: true }
-        },
-      )
+      const timeoutMs = Number(process.env.INVESTIGATION_TIMEOUT_MS ?? 60000)
+      const claim = () => db.locked('request:' + t.id, async tx => {
+        const tenant = await TenantScope.inTransaction(tx, a.tenant_id)
+        const [existing] = await tenant.rows('runs', filter)
+        if (existing) {
+          if (existing.request_fingerprint !== fingerprint) throw fail(409, 'Request content changed')
+          return { run: existing, created: false, expired: [] }
+        }
+        const expired = await expireRuns(tx, t.id)
+        if ((await tx.query("SELECT 1 FROM runs WHERE ticket_id=$1 AND status='running'", [t.id])).length)
+          return { run: undefined, created: false, expired }
+        const [run] = await tx.query<Run>(
+          `INSERT INTO runs (id, tenant_id, actor_id, ticket_id, client_request_id, request_fingerprint,
+             created_at, status, lease_until)
+           VALUES ($1,$2,$3,$4,$5,$6,now(),'running',now()+$7 * interval '1 millisecond') RETURNING *`,
+          [crypto.randomUUID(), a.tenant_id, a.actor_id, t.id, client_request_id, fingerprint, timeoutMs + 5000],
+        )
+        return { run, created: true, expired }
+      })
+      let result = await claim()
+      while (!result.run) {
+        const previous = queues.get(t.id)
+        if (!previous || db instanceof PgStore) throw fail(409, 'Investigation already running')
+        await previous
+        result = await claim()
+      }
+      const { run, created, expired } = result
+      for (const { id } of expired) bus.emit('run:' + id)
       if (created) {
         metrics.for(a.tenant_id).runs_total++
-        let seq = 0
         const emit = async (data: Event['data']) => {
-          await new TenantScope(db, a.tenant_id).addChild('run_events', {
-            run_id: run.id,
-            seq: ++seq,
-            data,
+          const terminal = data.type === 'final' || data.type === 'error'
+          await db.tx(async tx => {
+            const active = await tx.query("SELECT 1 FROM runs WHERE id=$1 AND status='running' FOR UPDATE", [run.id])
+            if (!active.length) throw Error('Run already ended')
+            await appendEvent(tx, run.id, data)
+            if (terminal)
+              await tx.query('UPDATE runs SET status=$2, lease_until=NULL WHERE id=$1',
+                [run.id, data.type === 'final' ? 'completed' : 'failed'])
           })
           bus.emit('run:' + run.id)
-          if (['final', 'error'].includes(data.type)) notify(db, t.tenant_id, 'ticket', t.id)
+          if (terminal) notify(db, t.tenant_id, 'ticket', t.id)
         }
-        const task = (queues.get(t.id) ?? Promise.resolve())
-          .catch(() => {})
-          .then(async () => {
-            try {
-              await emit({ type: 'started' })
-              const source: InvestigationSource = fixture(t.scenario)
-              if (t.scenario === 'B' && permissions instanceof DemoPermissions) {
-                const current = await ticket(t.id, a)
-                source.sessionUpdatedAt = current.session_updated_at ?? undefined
-                source.get_login_sessions = async (email) => {
-                  const wrong = (await ticket(t.id, a)).session === 'wrong_account'
-                  const granted = await permissions.read(
-                    JSON.stringify([a.tenant_id, appName, 'bob']),
-                    viewer,
-                  )
-                  return fixture('B', {
-                    webStatus: granted ? 200 : 403,
-                    desktopStatus: !wrong && granted ? 200 : 403,
-                    ...(wrong && {
-                      principal: 'external-71',
-                      sessionEmail: 'other@personal.example',
-                    }),
-                  }).get_login_sessions(email)
-                }
+        const task = (async () => {
+          try {
+            await emit({ type: 'started' })
+            const source: InvestigationSource = fixture(t.scenario)
+            if (t.scenario === 'B' && permissions instanceof DemoPermissions) {
+              const current = await ticket(t.id, a)
+              source.sessionUpdatedAt = current.session_updated_at ?? undefined
+              source.get_login_sessions = async (email) => {
+                const wrong = (await ticket(t.id, a)).session === 'wrong_account'
+                const granted = await permissions.read(
+                  JSON.stringify([a.tenant_id, appName, 'bob']),
+                  viewer,
+                )
+                return fixture('B', {
+                  webStatus: granted ? 200 : 403,
+                  desktopStatus: !wrong && granted ? 200 : 403,
+                  ...(wrong && {
+                    principal: 'external-71',
+                    sessionEmail: 'other@personal.example',
+                  }),
+                }).get_login_sessions(email)
               }
-              const usage = await investigate(
-                db,
-                a,
-                t,
-                message,
-                key,
-                emit,
-                transport,
-                source,
-                undefined,
-                true,
-                { signal: shutdown.signal },
-                permissions,
-                req.id,
-              )
-              metrics.usage(a.tenant_id, usage)
-            } catch (err) {
-              metrics.for(a.tenant_id).runs_failed++
-              if (err instanceof Error && 'usage' in err)
-                metrics.usage(a.tenant_id, err.usage as Awaited<ReturnType<typeof investigate>>)
-              await emit({
-                type: 'error',
-                text:
-                  err instanceof Error && err.name === 'TimeoutError'
-                    ? '调查超时，请重试。'
-                    : '调查中断，请发起新一轮调查。',
-              })
             }
-          })
+            const usage = await investigate(
+              db,
+              a,
+              t,
+              message,
+              key,
+              emit,
+              transport,
+              source,
+              undefined,
+              true,
+              { signal: shutdown.signal, timeoutMs },
+              permissions,
+              req.id,
+            )
+            metrics.usage(a.tenant_id, usage)
+          } catch (err) {
+            metrics.for(a.tenant_id).runs_failed++
+            if (err instanceof Error && 'usage' in err)
+              metrics.usage(a.tenant_id, err.usage as Awaited<ReturnType<typeof investigate>>)
+            await emit({
+              type: 'error',
+              text:
+                err instanceof Error && err.name === 'TimeoutError'
+                  ? '调查超时，请重试。'
+                  : '调查中断，请发起新一轮调查。',
+            })
+          }
+        })()
         queues.set(t.id, task)
         void task
           .finally(() => {

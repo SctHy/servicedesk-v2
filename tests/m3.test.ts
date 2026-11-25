@@ -88,6 +88,84 @@ for (const pgMode of [false, true]) {
           await admin!.end()
         }
       })
+      async function twoApis() {
+        const other = new PgStore(new pg.Pool({
+          connectionString: process.env.TEST_DATABASE_URL, options: '-c search_path=' + schema,
+        }))
+        const gate = Promise.withResolvers<void>()
+        const key = randomBytes(32)
+        const a = await application(db, key, async (...args) => {
+          await gate.promise
+          return mockStream()(...args)
+        })
+        const headers = { 'x-demo-user': 'bob' }
+        const ticket = (await a.inject({ method: 'POST', url: '/api/tickets', headers,
+          payload: { scenario: 'A' } })).json().id
+        const start = (api: typeof a, id: string) => api.inject({
+          method: 'POST', url: '/api/tickets/' + ticket + '/runs', headers,
+          payload: { message: '调查', client_request_id: id },
+        })
+        const first = await start(a, 'first')
+        const b = await application(other, key, mockStream())
+        return { b, start, ticket, runId: first.json().runId, headers, release: gate.resolve,
+          async close() {
+            gate.resolve()
+            await Promise.all([a.close(), b.close()])
+            await other.close()
+          },
+        }
+      }
+      if (pgMode) {
+        it('streams live run events across APIs and replays the exact suffix', async () => {
+          const pair = await twoApis()
+          try {
+            const origin = await pair.b.listen({ host: '127.0.0.1', port: 0 })
+            const url = '/api/runs/' + pair.runId + '/events'
+            const response = await fetch(origin + url, { headers: pair.headers, signal: AbortSignal.timeout(4000) })
+            const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader()
+            let body = ''
+            while (!body.includes('\n\n')) {
+              const chunk = await reader.read()
+              if (chunk.done) throw Error('Stream closed before first event')
+              body += chunk.value
+            }
+            expect(body).toContain('"started"')
+            pair.release()
+            for (;;) {
+              const chunk = await reader.read()
+              if (chunk.done) break
+              body += chunk.value
+            }
+            const rows = await db.query<{seq: number; data: { type: string }}>(
+              'SELECT seq,data FROM run_events WHERE run_id=$1 ORDER BY seq', [pair.runId])
+            expect(rows.at(-1)?.data.type).toBe('final')
+            const frames = rows.map(e => 'id: ' + e.seq + '\ndata: ' + JSON.stringify(e.data) + '\n\n')
+            expect(body).toBe(frames.join(''))
+            const resumed = await pair.b.inject({ url, headers: { ...pair.headers, 'last-event-id': '1' } })
+            expect(resumed.body).toBe(frames.slice(1).join(''))
+          } finally { await pair.close() }
+        })
+        it('rejects a competing API run and takes over an expired lease', async () => {
+          const pair = await twoApis()
+          try {
+            expect((await pair.start(pair.b, 'first')).json().runId).toBe(pair.runId)
+            expect((await pair.start(pair.b, 'second')).statusCode).toBe(409)
+            const runs = await db.rows('runs', { ticket_id: pair.ticket })
+            expect(runs).toHaveLength(1)
+            expect(runs[0].status).toBe('running')
+            await expect(db.add('runs', { ...runs[0], id: crypto.randomUUID(), client_request_id: 'collision' }))
+              .rejects.toMatchObject({ code: '23505', constraint: 'runs_one_running_per_ticket' })
+            await db.query("UPDATE runs SET lease_until=now() WHERE id=$1", [pair.runId])
+            const next = await pair.start(pair.b, 'second')
+            expect(next.statusCode).toBe(202)
+            const stream = await pair.b.inject({ url: '/api/runs/' + next.json().runId + '/events', headers: pair.headers })
+            expect(stream.body).toContain('"final"')
+            expect((await db.rows('runs', { id: pair.runId }))[0]).toMatchObject({ status: 'failed', lease_until: null })
+          } finally { await pair.close() }
+          const events = await db.rows('run_events', { run_id: pair.runId })
+          expect(events.filter(e => ['error','final'].includes(e.data.type)).map(e => e.data.type)).toEqual(['error'])
+        })
+      }
       async function queue(reason = input.reason) {
         const c = await draft(db, bob, { ...input, reason })
         await decide(db, carol, c.id, {

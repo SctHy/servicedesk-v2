@@ -33,6 +33,10 @@ export function listenChanges(db: PgStore) {
   return db.listenEvents(payload => {
     let event
     try { event = JSON.parse(payload) } catch { return }
+    if (event?.kind === 'run' && typeof event.runId === 'string') {
+      events(db).emit('run:' + event.runId)
+      return
+    }
     if (event?.type !== 'change' || typeof event.tenantId !== 'string' ||
         typeof event.id !== 'string') return
     notify(db, event.tenantId, 'change', event.id)
