@@ -1,3 +1,5 @@
+import { TenantScope } from '../db/tenant.js'
+import { changeCommitted, notify } from '../http/events.js'
 import { createHash } from 'node:crypto'
 import type { Store, Auth, Ticket, Evidence } from '../db/store.js'
 import type { Change, Job } from './types.js'
@@ -66,7 +68,7 @@ export async function draft(
   const hash = createHash('sha256')
     .update(JSON.stringify(expires_at ? { ...payload, expires_at } : payload))
     .digest('hex')
-  return db.locked('draft:' + hash, async (tx) => {
+  const result = await new TenantScope(db,a.tenant_id).locked('draft:' + hash, async (tx) => {
     const [existing] = await tx.rows('changes', {
       payload_hash: hash,
       status: 'pending_approval',
@@ -85,18 +87,21 @@ export async function draft(
       updated_at: now(),
     }
     await tx.add('changes', c)
-    await tx.add('change_audit', { id: crypto.randomUUID(), change_id: c.id,
+    await tx.addChild('change_audit', { id: crypto.randomUUID(), change_id: c.id,
       actor_id: a.actor_id, action: c.status, note: '', created_at: c.created_at })
     return c
   })
+  notify(db, a.tenant_id, "change", result.id)
+  return result
 }
-export async function enqueue(tx: Store, c: Change, kind: Job['kind']) {
+export async function enqueue(tx: TenantScope, c: Change, kind: Job['kind'], traceparent?: string) {
   if ((await tx.rows('jobs', { change_id: c.id, kind })).length) return
   const job: Job = {
     id: crypto.randomUUID(),
     tenant_id: c.tenant_id,
     change_id: c.id,
     kind,
+    traceparent,
     run_at: kind === 'grant' ? now() : c.expires_at!,
     resource_key: resource(c),
     status: 'queued',
@@ -116,12 +121,13 @@ export async function decide(
   id: string,
   body: { payload_hash?: string; decision?: string; note?: string },
   resolve = false,
+  traceparent?: string,
 ) {
   if (!privileged(a)) throw error(403, 'Approval permission required')
   const filter = { id, tenant_id: a.tenant_id }
-  const [initial] = await db.rows('changes', filter)
+  const [initial] = await new TenantScope(db,a.tenant_id).rows('changes', filter)
   if (!initial) throw error(404, 'Change unavailable')
-  return db.locked(resource(initial), async (tx) => {
+  const result = await new TenantScope(db,a.tenant_id).locked(resource(initial), async (tx) => {
     const [c] = await tx.rows('changes', filter)
     if (a.actor_id === c.requester_id || a.actor_id === c.beneficiary_principal)
       throw error(403, 'Independent reviewer required')
@@ -163,14 +169,14 @@ export async function decide(
         throw error(409, 'Stale job')
       if (status === 'succeeded') {
         if (j.kind === 'revoke') status = 'revoked'
-        else if (c.expires_at) await enqueue(tx, c, 'revoke')
+        else if (c.expires_at) await enqueue(tx, c, 'revoke', traceparent)
       }
     } else {
       if (decision !== 'approve' && decision !== 'reject')
         throw error(400, 'Invalid decision')
       status = decision === 'approve' ? 'approved' : 'rejected'
       if (status === 'approved') {
-        await enqueue(tx, c, 'grant')
+        await enqueue(tx, c, 'grant', traceparent)
       }
     }
     await tx.update('changes', filter, {
@@ -179,7 +185,7 @@ export async function decide(
       ...(resolve ? {} : { approver_id: a.actor_id, decision_note: note }),
       updated_at: now(),
     })
-    await tx.add('change_audit', {
+    await tx.addChild('change_audit', {
       id: crypto.randomUUID(),
       change_id: id,
       action: status,
@@ -189,4 +195,6 @@ export async function decide(
     })
     return { id, status }
   })
+  await changeCommitted(db, a.tenant_id, id)
+  return result
 }

@@ -136,8 +136,8 @@ export async function runPairs(
   }[] = []
   for (const [index, pair] of pairs.slice(0, limit).entries()) {
     for (const c of pair.cases) {
-      const started = Date.now(),
-        db = new MemoryStore()
+      const started = Date.now()
+      await using db = new MemoryStore()
       const t: Ticket = {
         id: crypto.randomUUID(),
         tenant_id: 'demo',

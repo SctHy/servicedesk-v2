@@ -1,3 +1,6 @@
+import { TenantScope } from '../db/tenant.js'
+import { traceparent } from '../http/trace.js'
+import { changeCommitted, notify } from '../http/events.js'
 import type { Store } from '../db/store.js'
 import type { Job } from './types.js'
 import { enqueue, now, viewer } from './service.js'
@@ -25,145 +28,140 @@ export class DemoPermissions implements PermissionsAdapter {
     await this.db.add('demo_grants', { resource_key: key, role })
   }
 }
-const fence = (j: Job) => ({
-  id: j.id,
-  status: j.status,
-  version: j.version,
-  lease_owner: j.lease_owner,
-  lease_until: j.lease_until,
-})
 export class Executor {
   readonly owner = crypto.randomUUID()
   constructor(
     private db: Store,
     readonly adapter: PermissionsAdapter = new DemoPermissions(db),
     private leaseMs = 30000,
+    private record?: (tenant: string, action: 'succeeded' | 'revoked' | 'manual_review') => void,
   ) {}
   async run() {
-    const jobs = [
-      ...(await this.db.rows('jobs', { status: 'running' })),
-      ...(await this.db.rows('jobs', { status: 'queued' })),
-    ]
-    for (const j of jobs.filter((job) => Date.parse(job.run_at) <= Date.now()))
-      await this.step(j)
+    const jobs = await this.db.query<Job>(
+      `SELECT * FROM jobs WHERE
+      ((status='queued' AND run_at <= $1) OR (status='running' AND lease_until <= $1))
+      ORDER BY run_at ASC`,
+      [now()],
+    )
+    for (const job of jobs) await this.step(job)
   }
   async step(seen: Job) {
     const claimed = await this.db.locked(seen.resource_key, async (tx) => {
-      const siblings = await tx.rows('jobs', {
-        resource_key: seen.resource_key,
-      })
-      const j = siblings.find((x) => x.id === seen.id)
-      if (
-        !j ||
-        Date.parse(j.run_at) > Date.now() ||
-        j.version !== seen.version ||
-        (j.status !== 'queued' &&
-          !(j.status === 'running' && Date.parse(j.lease_until!) <= Date.now()))
+      const scope = await TenantScope.inTransaction(tx, seen.tenant_id)
+      const [eligible] = await tx.query<Job>(
+        `SELECT * FROM jobs WHERE id=$2 AND version=$3 AND tenant_id=$4 AND resource_key=$5 AND
+        ((status='queued' AND run_at <= $1) OR (status='running' AND lease_until <= $1))
+        AND NOT EXISTS (SELECT 1 FROM jobs sibling WHERE sibling.resource_key=jobs.resource_key
+          AND sibling.id<>jobs.id AND sibling.status IN ('running','manual_review'))
+        ORDER BY run_at ASC FOR UPDATE SKIP LOCKED`,
+        [now(), seen.id, seen.version, seen.tenant_id, seen.resource_key],
       )
-        return
-      if (
-        siblings.some(
-          (x) =>
-            x.id !== j.id &&
-            (x.status === 'running' || x.status === 'manual_review'),
-        )
+      if (!eligible) return
+      const [j] = await tx.query<Job>(
+        `UPDATE jobs SET status='running', version=version+1,
+        attempt_count=attempt_count+1, lease_owner=$2, lease_until=$3, updated_at=now()
+        WHERE id=$1 RETURNING *`,
+        [
+          seen.id,
+          this.owner,
+          new Date(Date.now() + this.leaseMs).toISOString(),
+        ],
       )
-        return
-      const patch = {
-        status: 'running' as const,
-        version: j.version + 1,
-        attempt_count: j.attempt_count + 1,
-        lease_owner: this.owner,
-        lease_until: new Date(Date.now() + this.leaseMs).toISOString(),
-        updated_at: now(),
-      }
-      if ((await tx.update('jobs', fence(j), patch)) !== 1) return
-      await tx.update(
+      await scope.update(
         'changes',
         { id: j.change_id },
         { status: 'executing', updated_at: now() },
       )
-      await tx.add('change_audit', {
-        id: crypto.randomUUID(), change_id: j.change_id, actor_id: 'system',
-        action: 'executing', note: j.kind, created_at: patch.updated_at,
+      await scope.addChild('change_audit', {
+        id: crypto.randomUUID(),
+        change_id: j.change_id,
+        actor_id: 'system',
+        action: 'executing',
+        note: j.kind,
+        created_at: j.updated_at,
       })
-      return { ...j, ...patch }
+      const [change] = await scope.rows('changes', { id: j.change_id })
+      const overlap =
+        j.kind === 'revoke' &&
+        (
+          await tx.query(
+            `SELECT 1 FROM changes
+        WHERE id<>$1 AND tenant_id=$2 AND app=$3 AND role=$4 AND beneficiary_principal=$5
+        AND status='succeeded' AND (expires_at IS NULL OR expires_at>now()) LIMIT 1`,
+            [
+              change.id,
+              change.tenant_id,
+              change.app,
+              change.role,
+              change.beneficiary_principal,
+            ],
+          )
+        ).length > 0
+      return { j, change, overlap }
     })
     if (!claimed) return
-    await this.db.locked(seen.resource_key, async (tx) => {
-      const [j] = await tx.rows('jobs', fence(claimed))
-      if (!j || Date.parse(j.lease_until!) <= Date.now()) return
-      const [change] = await tx.rows('changes', { id: j.change_id })
-      let confirmed: boolean | null = null
-      let expiredBeforeWrite = false
-      const granting = j.kind === 'grant'
-      const overlap =
-        !granting &&
-        (
-          await tx.rows('changes', {
-            tenant_id: change.tenant_id,
-            app: change.app,
-            role: change.role,
-            beneficiary_principal: change.beneficiary_principal,
-            status: 'succeeded',
-          })
-        ).some(
-          (c) =>
-            c.id !== change.id &&
-            (!c.expires_at || Date.parse(c.expires_at) > Date.now()),
-        )
-      if (!overlap) {
-        try {
-          confirmed = await this.adapter.read(j.resource_key, change.role)
-          expiredBeforeWrite =
-            granting &&
-            confirmed === false &&
-            change.expires_at !== null &&
-            Date.parse(change.expires_at) <= Date.now()
-          if (!expiredBeforeWrite && confirmed === !granting) {
-            if (Date.parse(j.lease_until!) <= Date.now()) return
-            try {
-              await this.adapter[j.kind](j.resource_key, change.role)
-            } catch {
-              // A timeout can follow a committed external write. Verify before deciding.
-            }
-            if (
-              this.adapter instanceof DemoPermissions &&
-              this.adapter.fault === 'crash_after_external_write'
-            )
-              return
-            confirmed = await this.adapter.read(j.resource_key, change.role)
+    const { j, change, overlap } = claimed
+    notify(this.db, change.tenant_id, 'change', change.id)
+    const trace = traceparent(j.traceparent)
+    const granting = j.kind === 'grant'
+    let confirmed: boolean | null = null
+    let expiredBeforeWrite = false
+    if (!overlap) {
+      try {
+        confirmed = await this.adapter.read(j.resource_key, change.role, trace)
+        expiredBeforeWrite =
+          granting &&
+          confirmed === false &&
+          change.expires_at !== null &&
+          Date.parse(change.expires_at) <= Date.now()
+        if (!expiredBeforeWrite && confirmed === !granting) {
+          if (Date.parse(j.lease_until!) <= Date.now()) return
+          try {
+            await this.adapter[j.kind](j.resource_key, change.role, trace)
+          } catch {
+            // A timeout can follow a committed external write. Verify before deciding.
           }
-        } catch {
-          confirmed = null
+          if (
+            this.adapter instanceof DemoPermissions &&
+            this.adapter.fault === 'crash_after_external_write'
+          )
+            return
+          confirmed = await this.adapter.read(j.resource_key, change.role, trace)
         }
+      } catch {
+        confirmed = null
       }
-      if (Date.parse(j.lease_until!) <= Date.now()) return
-      const status = expiredBeforeWrite
-        ? 'failed'
-        : overlap || confirmed === granting
-          ? 'succeeded'
-          : 'manual_review'
-      if (
-        (await tx.update('jobs', fence(j), {
+    }
+    if (Date.parse(j.lease_until!) <= Date.now()) return
+    const status = expiredBeforeWrite
+      ? 'failed'
+      : overlap || confirmed === granting
+        ? 'succeeded'
+        : 'manual_review'
+    const committed = await this.db.tx(async (tx) => {
+      const scope = await TenantScope.inTransaction(tx, change.tenant_id)
+      const updated = await tx.query(
+        `UPDATE jobs SET status=$4, version=version+1,
+        lease_owner=NULL, lease_until=NULL, updated_at=now(), last_error=$5
+        WHERE id=$1 AND status='running' AND version=$2 AND lease_owner=$3 AND lease_until>now()
+        RETURNING id`,
+        [
+          j.id,
+          j.version,
+          this.owner,
           status,
-          version: j.version + 1,
-          lease_owner: null,
-          lease_until: null,
-          last_error:
-            status === 'succeeded'
-              ? null
-              : expiredBeforeWrite
-                ? 'Expired before grant'
-                : 'External permission unconfirmed',
-          updated_at: now(),
-        })) !== 1
+          status === 'succeeded'
+            ? null
+            : expiredBeforeWrite
+              ? 'Expired before grant'
+              : 'External permission unconfirmed',
+        ],
       )
-        return
+      if (!updated.length) return false
       const action = status === 'succeeded' && !granting ? 'revoked' : status
       if (granting && status === 'succeeded' && change.expires_at)
-        await enqueue(tx, change, 'revoke')
-      await tx.add('change_audit', {
+        await enqueue(scope, change, 'revoke', trace)
+      await scope.addChild('change_audit', {
         id: crypto.randomUUID(),
         change_id: change.id,
         actor_id: 'system',
@@ -171,7 +169,7 @@ export class Executor {
         note: overlap ? '其他有效授权仍需该角色' : j.kind,
         created_at: now(),
       })
-      await tx.update(
+      await scope.update(
         'changes',
         { id: j.change_id },
         {
@@ -180,6 +178,11 @@ export class Executor {
           updated_at: now(),
         },
       )
+      return true
     })
+    if (committed) {
+      if (status !== 'failed') this.record?.(change.tenant_id, status === 'succeeded' && !granting ? 'revoked' : status)
+      await changeCommitted(this.db, change.tenant_id, change.id)
+    }
   }
 }

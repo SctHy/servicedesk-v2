@@ -6,10 +6,11 @@ import { fixture } from '../adapters/demo.js'
 import { classify } from '../investigation/mock.js'
 
 export async function privacyReport() {
-  const db = new MemoryStore(),
-    key = randomBytes(32)
+  await using db = new MemoryStore()
+  const key = randomBytes(32)
   const auth = { tenant_id: 'demo', actor_id: 'tester', department_id: 'it' }
   const ticket = { ...auth, id: crypto.randomUUID(), scenario: 'B' as const }
+  await db.add('tickets', {id:ticket.id, actor_id:auth.actor_id, tenant_id:auth.tenant_id, scenario:ticket.scenario})
   const vault = await Vault.open(db, ticket, key)
   const corpus = {
     email: ['han+it@corp.example', 'li.chen@test.example'],

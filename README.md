@@ -1,12 +1,12 @@
 # ServiceDesk v2
 
-面向 IT 服务台的最小权限调查工作台。它把一次「桌面 403」转成可复核的证据链，再由独立审批人确认权限变更。模型通过脱敏网关读取观测并起草，执行器负责授权、到期回收和审计。默认使用内存和 Mock，无需凭据。
+面向 IT 服务台的最小权限调查工作台。它把一次「桌面 403」转成可复核的证据链，再由独立审批人确认权限变更。模型通过脱敏网关读取观测并起草，执行器负责授权、到期回收和审计。默认使用内存 PGlite 和 Mock，无需凭据。
 
 | 实测范围 | 结果 |
 |---|---|
-| 启用 PostgreSQL 的全量测试（含 Memory 对照） | 52 项通过，含真实 SIGKILL 后租约接管 |
-| gpt-6.2-sol 历史配对实测 | 16/16，8 对全部通过 |
-| gpt-6.2-sol 历史动态工作流 | 五项 × 三轮，15/15，pass^3 = 100% |
+| 启用 PostgreSQL 的全量测试（含 Memory 对照） | 57/57，含跨进程 SSE 与 SIGKILL 后租约接管 |
+| gpt-6.2-sol（low）v4 配对实测 | 16/16，8 对全部通过 |
+| gpt-6.2-sol（low）v4 动态工作流 | 17/21（80.95%），pass@3 = 6/7，pass^3 = 5/7 |
 
 [系统架构与排错复盘](docs/architecture.md) · [模型实测报告与逐例账本](docs/model-eval-report.md)
 
@@ -41,11 +41,12 @@ openssl rand -base64 32
 
 ## 接口
 
-GET /healthz 与 GET /api/demo/scenarios 公开。其余接口传 x-demo-user（alice、bob、carol 或 guest）。
+GET /healthz 与 GET /api/demo/scenarios 公开。其余接口优先校验由服务端使用 MASK_KEY 签发的 HMAC-SHA256 Bearer Token。演示模式也接受 x-demo-user（alice、bob、carol 或 guest）。设置 ALLOW_DEMO_AUTH=0 可关闭演示头。
 
 | 请求 | 输入或用途 |
 |---|---|
 | POST /api/tickets | JSON 字段 scenario 取 A 或 B |
+| GET /api/metrics | 本租户在当前 API 进程的运行、工具、Token 与任务计数 |
 | GET /api/tickets | 当前用户的工单 |
 | GET /api/tickets/:id | 工单、带 stale 标志的证据、变更、调查轮次 |
 | POST /api/tickets/:id/runs | JSON 字段 message 与 client_request_id。同键同内容返回原 runId，内容冲突返回 409 |
@@ -57,6 +58,8 @@ GET /healthz 与 GET /api/demo/scenarios 公开。其余接口传 x-demo-user（
 | POST /api/changes/:id/decision | carol 提交 decision、payload_hash，可附 note；禁止自审 |
 | POST /api/changes/:id/resolve | 有权限的审核人提交核对结果、payload_hash 和 note |
 | GET /api/runs/:runId/events | SSE，支持 Last-Event-ID。关闭订阅后调查继续 |
+
+PGlite 与 PostgreSQL 共用 SQL 迁移和事务。TenantScope 绑定租户，SSE 按事件通知读取持久化序号。外部权限 I/O 在事务外执行。HTTP 响应和执行器的权限请求携带 traceparent。角色清单与会话以权限终态和会话变更时间为水位线刷新，追问措辞不影响判定。
 
 工具通过工单绑定的 scope 和 ref 读取模拟系统，所有模型请求经过同一脱敏网关。审批通过时在同一事务中创建执行任务。执行器按资源串行处理并核验授权，状态不明时进入人工核对。调查默认预算为每轮 60000 毫秒，可用 INVESTIGATION_TIMEOUT_MS 配置；服务关闭或超时会终止调查并记录 error 事件。Mock 的结论依据会话与权限证据生成，演示只覆盖预置案例。每个部署运行一个 API 进程，同一工单的调查在进程内串行执行。
 
@@ -89,16 +92,16 @@ LIVE_MODEL=1 bun run eval:paired > eval-output/paired.json
 
 `bun run eval:workflow` 默认以 Mock 模型运行五条工单流程，覆盖审批生效、授权后切换账号、清单不可用、拒绝 admin 和人工核对。它通过真实调查与执行器检查最终业务状态、策略、带本轮证据引用的状态报告及调用和时间预算。使用本地模型配置运行 `LIVE_MODEL=1 bun run eval:workflow` 可获取真实模型的 JSON 账本，任一任务未通过时退出码为 1。
 
-### v3 原始观测与稳定性
+### v4 原始观测与稳定性
 
 目录工具读取身份、组和许可证，会话工具比对桌面与网页主体，应用工具读取角色清单与同步状态。服务事件工具返回故障、错误日志、刷新审计和服务状态，调查可按请求标识及事件时间核对。第五个只读工具检索当前用户可见的手册。起草工具按应用和角色策略验证工单归属及最新会话、权限证据，审批后由执行器写入并复核对应角色。
 
 ```sh
-LIVE_MODEL=1 bun run eval:paired > eval-output/gpt-paired-v3.json
-LIVE_MODEL=1 WORKFLOW_RUNS=3 bun run eval:workflow > eval-output/gpt-workflow-v3.json
+LIVE_MODEL=1 bun run eval:paired > eval-output/gpt-paired-v4.json
+LIVE_MODEL=1 WORKFLOW_RUNS=3 bun run eval:workflow > eval-output/gpt-workflow-v4.json
 ```
 
-`WORKFLOW_RUNS` 默认为 1。每轮顺序运行五项独立任务。meanPassRate 是各轮通过率均值，passAtK 是至少通过一次的任务占比，passAllK 是每轮均通过的任务占比。perTask 按轮列出每项任务的通过情况，meanPerRun 给出每轮平均 token 用量和耗时。
+`WORKFLOW_RUNS` 默认为 1。每轮顺序运行七项独立任务。meanPassRate 是各轮通过率均值，passAtK 是至少通过一次的任务占比，passAllK 是每轮均通过的任务占比。perTask 按轮列出每项任务的通过情况，meanPerRun 给出每轮平均 token 用量和耗时。
 
 ### 可选 HTTP 权限服务
 

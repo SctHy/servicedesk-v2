@@ -11,3 +11,5 @@ eval-output/*
 
 !eval-output/gpt-paired-v3.json
 !eval-output/gpt-workflow-v3.json
+!eval-output/gpt-paired-v4.json
+!eval-output/gpt-workflow-v4.json

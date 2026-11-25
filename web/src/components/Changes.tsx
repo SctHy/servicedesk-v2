@@ -28,7 +28,9 @@ export function Changes({
   api,
   report,
   onCount,
+  revision,
 }: {
+  revision: number
   onCount: (count: number) => void
   user: string
   api: (path: string, body?: unknown, signal?: AbortSignal) => Promise<Response>
@@ -47,12 +49,10 @@ export function Changes({
     const ctl = new AbortController()
     const load = () => void refresh(ctl.signal).catch(report)
     load()
-    const timer = setInterval(load, 1500)
     return () => {
-      clearInterval(timer)
       ctl.abort()
     }
-  }, [user])
+  }, [user, revision])
   async function act(path: string, body: unknown) {
     try {
       await api(path, body)

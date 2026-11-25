@@ -2,7 +2,7 @@ import { useResizableWidth } from './hooks/useResizableWidth'
 import { ScrollArea } from '@base-ui/react/scroll-area'
 import { Observation, type Entry } from './components/Observation'
 import { useState, useEffect, useRef } from 'react'
-import { client } from './api'
+import { client, tenantEvents } from './api'
 import { Changes } from './components/Changes'
 import {
   ArrowUp,
@@ -48,6 +48,18 @@ function Desk({
   const [cases, setCases] = useState<{ id: string; title: string }[]>([])
   const current = useRef<AbortController | null>(null)
   const api = client(user)
+  const [revision, setRevision] = useState({ change: 0, fault: 0, ticket: 0 })
+  useEffect(() => {
+    const ctl = new AbortController()
+    void tenantEvents(user, ctl.signal, (type) =>
+      setRevision((r) => ({
+        change: r.change + Number(type === 'all' || type === 'change'),
+        fault: r.fault + Number(type === 'all' || type === 'fault'),
+        ticket: r.ticket + Number(type === 'all' || type === 'ticket'),
+      })),
+    )
+    return () => ctl.abort()
+  }, [user])
   function report(e: unknown) {
     if (!(e instanceof DOMException && e.name === 'AbortError'))
       setError(String(e))
@@ -55,9 +67,6 @@ function Desk({
   useEffect(() => {
     const ctl = new AbortController()
     Promise.all([
-      api('tickets', undefined, ctl.signal)
-        .then((r) => r.json())
-        .then(setTickets),
       api('demo/scenarios', undefined, ctl.signal)
         .then((r) => r.json())
         .then(setCases),
@@ -67,6 +76,14 @@ function Desk({
       current.current?.abort()
     }
   }, [])
+  useEffect(() => {
+    const ctl = new AbortController()
+    api('tickets', undefined, ctl.signal)
+      .then((r) => r.json())
+      .then(setTickets)
+      .catch(report)
+    return () => ctl.abort()
+  }, [user, revision.ticket])
   async function subscribe(run: string, signal: AbortSignal) {
     let cursor = 0
     for (let attempt = 0; ; attempt++) {
@@ -212,12 +229,10 @@ function Desk({
       }
     }
     void refresh()
-    const timer = setInterval(refresh, 1500)
     return () => {
       ctl.abort()
-      clearInterval(timer)
     }
-  }, [id])
+  }, [id, revision.ticket, revision.change])
   const selected = tickets.find((t) => t.id === id)
   const [query, setQuery] = useState('')
   function completionTime(ticket: string) {
@@ -276,7 +291,7 @@ function Desk({
       })
       .catch(() => setAvailable(false))
     return () => ctl.abort()
-  }, [user])
+  }, [user, revision.fault])
   const [sidebar, setSidebar] = useState(() => window.innerWidth >= 760)
   const [inspector, setInspector] = useState(() => window.innerWidth >= 1200)
   const left = useResizableWidth('left', 256, 200, 420)
@@ -568,6 +583,7 @@ function Desk({
           <div {...right.handle} />
           <div className="details-scroll">
             <Changes
+              revision={revision.change}
               user={user}
               api={api}
               report={report}

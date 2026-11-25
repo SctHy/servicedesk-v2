@@ -1,5 +1,7 @@
 import type { Ticket } from '../db/store.js'
+import type { InvestigationSource } from './source.js'
 export type Observations = {
+  sessionUpdatedAt?: string
   principal?: string | null
   sessionEmail?: string
   license?: 'valid' | 'expired'
@@ -42,6 +44,7 @@ export function fixture(
   }
   return {
     directory,
+    sessionUpdatedAt: observations.sessionUpdatedAt,
     get_directory_profile(value: string) {
       check(value)
       return directory
@@ -86,14 +89,14 @@ export function fixture(
         ...(observations.globalIncident !== undefined && { serviceStatus: { globalOutage: observations.globalIncident } }),
       }
     },
-  }
+  } satisfies InvestigationSource
 }
 export function compare(
   mail?: string,
   other?: string,
   id?: string,
   otherId?: string,
-) {
+): Pick<Awaited<ReturnType<InvestigationSource['get_login_sessions']>>, 'sameMailbox' | 'samePrincipal'> {
   return {
     sameMailbox:
       mail && other ? mail.toLowerCase() === other.toLowerCase() : 'unknown',

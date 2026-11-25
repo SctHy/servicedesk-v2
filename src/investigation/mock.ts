@@ -149,7 +149,7 @@ export function classify(
   profile: { groups?: string[]; license?: string },
   app: Record<string, unknown>,
   question: string,
-  events: ReturnType<ReturnType<typeof import('../adapters/demo.js').fixture>['get_service_events']>,
+  events: Awaited<ReturnType<import('../adapters/source.js').InvestigationSource['get_service_events']>>,
 ) {
   if (session.samePrincipal === false) return 'SWITCH_ACCOUNT'
   if (session.sameMailbox === false)

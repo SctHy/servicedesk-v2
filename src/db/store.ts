@@ -1,3 +1,4 @@
+import { PGlite } from '@electric-sql/pglite'
 import type { Change, Job } from '../changes/types.js'
 import pg from 'pg'
 import { readFile } from 'node:fs/promises'
@@ -11,6 +12,8 @@ export type Auth = {
 }
 export type Ticket = Pick<Auth, 'tenant_id' | 'actor_id'> & {
   id: string
+  session?: 'normal' | 'wrong_account'
+  session_updated_at?: string | null
   scenario: 'A' | 'B'
 }
 export type Run = Pick<Ticket, 'tenant_id' | 'actor_id'> & {
@@ -41,7 +44,7 @@ export type Chunk = {
   code: string
   body: string
 }
-type Tables = {
+export type Tables = {
   changes: Change
   jobs: Job
   demo_grants: { resource_key: string; role: string }
@@ -65,124 +68,59 @@ type Tables = {
     cipher: string
   }
 }
-type WithDefaults<Row, Keys extends keyof Row> = Omit<Row, Keys> & Partial<Pick<Row, Keys>>
+type WithDefaults<Row, Keys extends keyof Row> = Omit<Row, Keys> &
+  Partial<Pick<Row, Keys>>
 type Inserts = Omit<Tables, 'changes' | 'jobs'> & {
   changes: WithDefaults<Change, 'expires_at' | 'revoked_at'>
   jobs: WithDefaults<Job, 'kind' | 'run_at'>
 }
-export interface Store {
-  removeGrant(key: string, role: string): Promise<void>
-  rows<K extends keyof Tables>(
-    table: K,
-    filter: Partial<Tables[K]>,
-  ): Promise<Tables[K][]>
-  add<K extends keyof Tables>(table: K, row: Inserts[K]): Promise<void>
-  update<K extends keyof Tables>(
-    table: K,
-    filter: Partial<Tables[K]>,
-    patch: Partial<Tables[K]>,
-  ): Promise<number>
-  locked<T>(key: string, work: (db: Store) => Promise<T>): Promise<T>
-}
-export class MemoryStore implements Store {
-  async removeGrant(key: string, role: string) {
-    this.tables.set('demo_grants', (this.tables.get('demo_grants') ?? []).filter(
-      row => Reflect.get(row, 'resource_key') !== key || Reflect.get(row, 'role') !== role))
-  }
-  private tables = new Map<string, object[]>()
-  private locks = new Map<string, Promise<unknown>>()
-  async rows<K extends keyof Tables>(table: K, filter: Partial<Tables[K]>) {
-    return structuredClone(
-      (this.tables.get(table) ?? []).filter((row) =>
-        Object.entries(filter).every(([k, v]) => Reflect.get(row, k) === v),
-      ),
-    ) as Tables[K][]
-  }
-  async add<K extends keyof Tables>(table: K, row: Inserts[K]) {
-    const rows = this.tables.get(table) ?? []
-    const defaults = table === 'jobs' ? { kind: 'grant', run_at: new Date().toISOString() }
-      : table === 'changes' ? { expires_at: null, revoked_at: null } : {}
-    rows.push(structuredClone({ ...defaults, ...row }))
-    this.tables.set(table, rows)
-  }
-  async update<K extends keyof Tables>(
-    table: K,
-    filter: Partial<Tables[K]>,
-    patch: Partial<Tables[K]>,
-  ) {
-    const rows = (this.tables.get(table) ?? []).filter((row) =>
-      Object.entries(filter).every(([k, v]) => Reflect.get(row, k) === v),
-    )
-    for (const row of rows) Object.assign(row, structuredClone(patch))
-    return rows.length
-  }
-  async locked<T>(key: string, work: (db: Store) => Promise<T>): Promise<T> {
-    const next = (this.locks.get(key) ?? Promise.resolve())
-      .catch(() => {})
-      .then(async () => {
-        const staged = new MemoryStore()
-        staged.tables = structuredClone(this.tables)
-        const commits: (() => void)[] = []
-        const tx: Store = {
-          removeGrant: async (key, role) => {
-            await staged.removeGrant(key, role)
-            commits.push(() => { void this.removeGrant(key, role) })
-          },
-          rows: staged.rows.bind(staged),
-          add: async (table, row) => {
-            await staged.add(table, row)
-            commits.push(() => {
-              void this.add(table, row)
-            })
-          },
-          update: async (table, filter, patch) => {
-            const n = await staged.update(table, filter, patch)
-            commits.push(() => {
-              void this.update(table, filter, patch)
-            })
-            return n
-          },
-          locked: async (_key, fn) => fn(tx),
-        }
-        const result = await work(tx)
-        for (const commit of commits) commit()
-        return result
-      })
-    this.locks.set(key, next)
-    try {
-      return await next
-    } finally {
-      if (this.locks.get(key) === next) this.locks.delete(key)
-    }
-  }
-}
-export class PgStore implements Store {
+type Query = (sql: string, params: unknown[]) => Promise<unknown[]>
+export class Store {
   constructor(
-    readonly pool: pg.Pool,
-    private client?: pg.PoolClient,
+    private read: Query,
+    readonly exec: (sql: string) => Promise<void>,
+    readonly tx: <T>(fn: (db: Store) => Promise<T>) => Promise<T>,
   ) {}
-  async removeGrant(key: string, role: string) {
-    await this.sql.query('DELETE FROM demo_grants WHERE resource_key=$1 AND role=$2', [key, role])
+
+  async query<T = Record<string, unknown>>(
+    sql: string,
+    params: unknown[] = [],
+  ): Promise<T[]> {
+    return JSON.parse(JSON.stringify(await this.read(sql, params)))
   }
-  private get sql() {
-    return this.client ?? this.pool
+
+  locked<T>(key: string, work: (db: Store) => Promise<T>) {
+    return this.tx(async (db) => {
+      await db.query('SELECT pg_advisory_xact_lock($1)', [
+        createHash('sha256').update(key).digest().readBigInt64BE().toString(),
+      ])
+      return work(db)
+    })
+  }
+  async removeGrant(key: string, role: string) {
+    await this.query(
+      'DELETE FROM demo_grants WHERE resource_key = $1 AND role = $2',
+      [key, role],
+    )
   }
   async rows<K extends keyof Tables>(table: K, filter: Partial<Tables[K]>) {
     const fields = Object.keys(filter)
     const where = fields
-      .map((k, i) => pg.escapeIdentifier(k) + ' IS NOT DISTINCT FROM $' + (i + 1))
+      .map(
+        (k, i) => pg.escapeIdentifier(k) + ' IS NOT DISTINCT FROM $' + (i + 1),
+      )
       .join(' AND ')
-    const result = await this.sql.query(
+    const result = await this.query(
       'SELECT * FROM ' +
         pg.escapeIdentifier(table) +
         (where ? ' WHERE ' + where : ''),
       Object.values(filter),
     )
-    return JSON.parse(JSON.stringify(result.rows)) as Tables[K][]
+    return result as Tables[K][]
   }
   async add<K extends keyof Tables>(table: K, row: Inserts[K]) {
     const fields = Object.keys(row)
-    await this.sql.query(
+    await this.query(
       'INSERT INTO ' +
         pg.escapeIdentifier(table) +
         ' (' +
@@ -208,67 +146,160 @@ export class PgStore implements Store {
         ' IS NOT DISTINCT FROM $' +
         (fields.length + i + 1),
     )
-    const result = await this.sql.query(
+    const result = await this.query(
       'UPDATE ' +
         pg.escapeIdentifier(table) +
         ' SET ' +
         sets.join(',') +
         ' WHERE ' +
-        where.join(' AND '),
+        where.join(' AND ') +
+        ' RETURNING 1',
       [...Object.values(patch), ...Object.values(filter)],
     )
-    return result.rowCount ?? 0
+    return result.length
   }
-  async locked<T>(key: string, work: (db: Store) => Promise<T>) {
-    const client = await this.pool.connect()
-    try {
-      await client.query('BEGIN')
-      await client.query('SELECT pg_advisory_xact_lock($1)', [
-        createHash('sha256').update(key).digest().readBigInt64BE(),
-      ])
-      const result = await work(new PgStore(this.pool, client))
-      await client.query('COMMIT')
-      return result
-    } catch (err) {
-      await client.query('ROLLBACK')
-      throw err
-    } finally {
-      client.release()
-    }
-  }
+
   async migrate() {
-    const sql = await readFile(
-      new URL('./migrations/001_init.sql', import.meta.url),
-      'utf8',
-    )
     await this.locked('migration', async (db) => {
-      const conn = (db as PgStore).sql
-      await conn.query(
+      await db.exec(
         'CREATE TABLE IF NOT EXISTS schema_migrations(version int PRIMARY KEY)',
       )
-      if (
-        !(await conn.query('SELECT 1 FROM schema_migrations WHERE version=1'))
-          .rowCount
-      ) {
-        await conn.query(sql)
-        await conn.query('INSERT INTO schema_migrations VALUES(1)')
-      }
-      if (
-        !(await conn.query('SELECT 1 FROM schema_migrations WHERE version=2'))
-          .rowCount
-      ) {
-        await conn.query(
+      const files = [
+        '001_init',
+        '002_m3_changes',
+        '003_m4_expiry',
+        '004_m5_indexes',
+        '005_observability',
+        '006_tenant_relations',
+      ]
+      for (const [i, file] of files.entries()) {
+        if (
+          (
+            await db.query('SELECT 1 FROM schema_migrations WHERE version=$1', [
+              i + 1,
+            ])
+          ).length
+        )
+          continue
+        await db.exec(
           await readFile(
-            new URL('./migrations/002_m3_changes.sql', import.meta.url),
+            new URL('./migrations/' + file + '.sql', import.meta.url),
             'utf8',
           ),
         )
-        await conn.query('INSERT INTO schema_migrations VALUES(2)')
-      }
-      if (!(await conn.query('SELECT 1 FROM schema_migrations WHERE version=3')).rowCount) {
-        await conn.query(await readFile(new URL('./migrations/003_m4_expiry.sql', import.meta.url), 'utf8'))
-        await conn.query('INSERT INTO schema_migrations VALUES(3)')
+        await db.query('INSERT INTO schema_migrations VALUES ($1)', [i + 1])
       }
     })
+  }
+}
+
+function scoped(query: Query, exec: Store['exec']): Store {
+  const db: Store = new Store(query, exec, (fn) => fn(db))
+  return db
+}
+
+export class PgStore extends Store {
+  async listenEvents(receive: (payload: string) => void) {
+    const client = await this.pool.connect()
+    const forward = (message: pg.Notification) => {
+      if (message.channel === 'desk_events' && message.payload) receive(message.payload)
+    }
+    client.on('notification', forward)
+    try {
+      await client.query('LISTEN desk_events')
+    } catch (error) {
+      client.release(true)
+      throw error
+    }
+    return async () => {
+      client.off('notification', forward)
+      try { await client.query('UNLISTEN desk_events') }
+      finally { client.release(true) }
+    }
+  }
+  constructor(readonly pool: pg.Pool) {
+    super(
+      async (s, p) => (await pool.query(s, p)).rows,
+      async (s) => {
+        await pool.query(s)
+      },
+      async (fn) => {
+        const client = await pool.connect()
+        try {
+          await client.query('BEGIN')
+          const result = await fn(
+            scoped(
+              async (s, p) => (await client.query(s, p)).rows,
+              async (s) => {
+                await client.query(s)
+              },
+            ),
+          )
+          await client.query('COMMIT')
+          return result
+        } catch (err) {
+          await client.query('ROLLBACK')
+          throw err
+        } finally {
+          client.release()
+        }
+      },
+    )
+  }
+  close() {
+    return this.pool.end()
+  }
+}
+
+export class MemoryStore extends Store {
+  private ready: Promise<void>
+  private engine: PGlite
+  constructor() {
+    const engine = new PGlite()
+    // PGlite.transaction queues transactions and standalone queries on its single connection.
+    const db = new Store(
+      async (s, p) => (await engine.query(s, p)).rows,
+      async (s) => {
+        await engine.exec(s)
+      },
+      (fn) =>
+        engine.transaction((t) =>
+          fn(
+            scoped(
+              async (s, p) => (await t.query(s, p)).rows,
+              async (s) => {
+                await t.exec(s)
+              },
+            ),
+          ),
+        ),
+    )
+    const ready = db.migrate()
+    super(
+      async (s, p) => {
+        await ready
+        return db.query(s, p)
+      },
+      async (s) => {
+        await ready
+        await db.exec(s)
+      },
+      async (fn) => {
+        await ready
+        return db.tx(fn)
+      },
+    )
+    this.ready = ready
+    this.engine = engine
+  }
+  async close() {
+    try {
+      await this.ready
+    } finally {
+      await this.engine.close()
+    }
+  }
+  [Symbol.asyncDispose]() {
+    return this.close()
   }
 }

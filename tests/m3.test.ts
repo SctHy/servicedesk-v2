@@ -15,6 +15,7 @@ const carol: Auth = { ...bob, actor_id: 'carol', role: 'approver' }
 const input = { app: appName, role: viewer, reason: '读取项目资料' }
 function permissionServer(mode: 'ok' | 'write-error' | 'unknown' | 'hold' = 'ok') {
   const grants = new Set<string>()
+  const traces: (string | null)[] = []
   const methods: string[] = []
   const written = Promise.withResolvers<void>()
   const release = Promise.withResolvers<void>()
@@ -25,6 +26,7 @@ function permissionServer(mode: 'ok' | 'write-error' | 'unknown' | 'hold' = 'ok'
       const url = new URL(req.url)
       if (url.pathname !== '/grants' || req.headers.get('Authorization') !== 'Bearer test')
         return new Response(null, { status: 403 })
+      traces.push(req.headers.get('traceparent'))
       methods.push(req.method)
       if (req.method === 'GET')
         return mode === 'unknown' ? new Response(null, { status: 503 }) :
@@ -46,7 +48,7 @@ function permissionServer(mode: 'ok' | 'write-error' | 'unknown' | 'hold' = 'ok'
   })
   return {
     url: server.url.href, adapter: new HttpPermissions(server.url.href, 'test'),
-    methods, written: written.promise, get writes() { return writes },
+    methods, traces, written: written.promise, get writes() { return writes }, release: () => release.resolve(),
     close() { release.resolve(); return server.stop(true) },
   }
 }
@@ -62,6 +64,7 @@ for (const pgMode of [false, true]) {
       beforeEach(async () => {
         if (!pgMode) {
           db = new MemoryStore()
+          await db.query('SELECT 1')
           return
         }
         schema = 't_' + crypto.randomUUID().replaceAll('-', '')
@@ -78,6 +81,7 @@ for (const pgMode of [false, true]) {
       afterEach(async () => {
         await http?.close()
         http = undefined
+        if (db instanceof MemoryStore) await db.close()
         if (pool) {
           await pool.end()
           await admin!.query('DROP SCHEMA ' + schema + ' CASCADE')
@@ -92,6 +96,26 @@ for (const pgMode of [false, true]) {
         })
         return (await db.rows('jobs', { change_id: c.id }))[0]
       }
+      it('allows a concurrent ticket transaction while grant is suspended', async () => {
+        const job = await queue()
+        const entered = Promise.withResolvers<void>()
+        const release = Promise.withResolvers<void>()
+        let granted = false
+        const executor = new Executor(db, {
+          read: async () => granted,
+          grant: async () => { entered.resolve(); await release.promise; granted = true },
+          revoke: async () => {},
+        })
+        const running = executor.step(job)
+        await entered.promise
+        try {
+          const id = crypto.randomUUID()
+          await db.tx(async tx => {
+            await tx.add('tickets', {id, tenant_id:bob.tenant_id, actor_id:bob.actor_id, scenario:'A'})
+            expect(await tx.rows('tickets',{id})).toHaveLength(1)
+          })
+        } finally { release.resolve(); await running }
+      })
       for (const overlap of [false, true]) {
         it('recovers expired access with overlap=' + overlap, async () => {
           const adapter = new DemoPermissions(db)
@@ -160,14 +184,21 @@ for (const pgMode of [false, true]) {
           expect((await request(path,'alice',{session:'wrong_account'})).statusCode).toBe(404)
           for (const session of ['wrong_account','normal']) {
             expect((await request(path,'bob',{session})).statusCode).toBe(200)
+            if (session === 'normal') {
+              const detail = (await request('/api/tickets/' + t.id, 'bob')).json()
+              expect(detail.evidence.filter((e: { stale: boolean }) => e.stale)
+                .map((e: { source: string }) => e.source)).toEqual(['get_login_sessions'])
+            }
             const run = (await request('/api/tickets/'+t.id+'/runs','bob',{
-              message:'重新检查',client_request_id:session,
+              message:'再看看现在情况怎么样',client_request_id:session,
             })).json()
             await request('/api/runs/'+run.runId+'/events','bob')
             const detail = (await request('/api/tickets/'+t.id,'bob')).json()
             const observations = detail.evidence.filter((e: {source:string})=>e.source==='get_login_sessions')
               .sort((a:{observed_at:string},b:{observed_at:string})=>a.observed_at.localeCompare(b.observed_at))
             expect(observations.at(-1).data.samePrincipal).toBe(session==='normal')
+            expect(observations.at(-1).stale).toBe(false)
+            expect(detail.evidence.filter((e: {source:string}) => e.source === 'get_app_permissions')).toHaveLength(1)
           }
           expect((await request('/api/demo/fault','guest',{fault:'unknown_external_state'})).statusCode).toBe(403)
           expect((await request('/api/demo/fault','carol',{fault:'unknown_external_state'})).statusCode).toBe(200)
@@ -291,7 +322,7 @@ for (const pgMode of [false, true]) {
           expect(result.toolFailures).toBe(0)
           expect(result.toolAttempts).toBeLessThanOrEqual(6)
           const answer = String(events.at(-1)?.text)
-          for (const source of ['get_app_permissions', 'get_login_sessions']) {
+          for (const source of state.sessionUpdatedAt ? ['get_login_sessions'] : ['get_app_permissions', 'get_login_sessions']) {
             const fresh = events.find(
               (e) => e.type === 'evidence' && e.source === source,
             )
@@ -314,14 +345,17 @@ for (const pgMode of [false, true]) {
         expect(http.methods.slice(-3)).toEqual(['GET', 'POST', 'GET'])
         expect((await db.rows('jobs', { change_id: change.id }))[0].status).toBe('succeeded')
         expect(await run('现在呢？')).toContain('权限已生效')
-        const wrong = await run('权限已经批了但还是 403', {
+        await Bun.sleep(2) // Model a later source transition at millisecond precision.
+        const wrong = await run('再看看现在情况怎么样', {
+          sessionUpdatedAt: new Date().toISOString(),
           principal: 'external',
           sessionEmail: 'alias@corp.example',
         })
         expect(wrong).toContain('登错账号')
         expect(wrong).toContain('已拥有 project-b:viewer')
+        await Bun.sleep(2)
         expect(
-          await run('切换回正确账号后重新检查', { desktopStatus: 200 }),
+          await run('现在呢？', { sessionUpdatedAt: new Date().toISOString(), desktopStatus: 200 }),
         ).toContain('访问已恢复')
         await executor.run()
         expect(await db.rows('changes', { ticket_id: ticket.id })).toHaveLength(
@@ -352,6 +386,43 @@ for (const pgMode of [false, true]) {
           }
         })
       }
+      if (pgMode) it('streams an independent worker completion to the API tenant', async () => {
+        http = permissionServer('hold')
+        const job = await queue()
+        const url = new URL(process.env.TEST_DATABASE_URL!)
+        url.searchParams.set('options', '-c search_path=' + schema)
+        const worker = Bun.spawn(['bun', 'src/changes/worker.ts'], {
+          env: { ...process.env, DATABASE_URL: url.href, PERMISSIONS_API_URL: http.url,
+            PERMISSIONS_API_TOKEN: 'test', PERMISSIONS_TIMEOUT_MS: '10000' },
+        })
+        let app: Awaited<ReturnType<typeof application>> | undefined
+        const controller = new AbortController()
+        try {
+          await Promise.race([http.written, worker.exited.then(() => { throw Error('Worker exited early') })])
+          app = await application(db, randomBytes(32))
+          const origin = await app.listen({ host: '127.0.0.1', port: 0 })
+          const response = await fetch(origin + '/api/events', {
+            headers: { 'x-demo-user': 'alice' },
+            signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
+          })
+          const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader()
+          http.release()
+          let buffer = ''
+          while (!/data: [^\n]+\n\n/.test(buffer)) {
+            const chunk = await reader.read()
+            if (chunk.done) throw Error('SSE closed before completion')
+            buffer += chunk.value
+          }
+          expect(JSON.parse(buffer.match(/data: ([^\n]+)/)![1])).toEqual({ type: 'change', id: job.change_id })
+          expect(await worker.exited).toBe(0)
+          expect((await db.rows('changes', { id: job.change_id }))[0].status).toBe('succeeded')
+        } finally {
+          controller.abort()
+          http.release()
+          await worker.exited
+          await app?.close()
+        }
+      }, 15000)
       if (pgMode) it('recovers after SIGKILL between external write and response', async () => {
         http = permissionServer('hold')
         const j = await queue()
@@ -393,28 +464,10 @@ for (const pgMode of [false, true]) {
       })
       it('rolls back approval and queue insertion if audit persistence fails', async () => {
         const c = await draft(db, bob, input)
-        const failing: Store = {
-          removeGrant: db.removeGrant.bind(db),
-          rows: db.rows.bind(db),
-          add: db.add.bind(db),
-          update: db.update.bind(db),
-          locked: (key, fn) =>
-            db.locked(key, (tx) =>
-              fn({
-                removeGrant: tx.removeGrant.bind(tx),
-                rows: tx.rows.bind(tx),
-                update: tx.update.bind(tx),
-                locked: tx.locked.bind(tx),
-                add: async (table, row) => {
-                  if (table === 'change_audit')
-                    throw Error('injected transaction failure')
-                  await tx.add(table, row)
-                },
-              }),
-            ),
-        }
+        await db.exec(`ALTER TABLE change_audit ADD CONSTRAINT injected
+          CHECK (action <> 'approved')`)
         await expect(
-          decide(failing, carol, c.id, {
+          decide(db, carol, c.id, {
             decision: 'approve',
             payload_hash: c.payload_hash,
           }),
@@ -505,7 +558,7 @@ for (const pgMode of [false, true]) {
 it('ends slow runs on deadline and shutdown, releasing the ticket queue', async () => {
   const previous = process.env.INVESTIGATION_TIMEOUT_MS
   process.env.INVESTIGATION_TIMEOUT_MS = '100'
-  const db = new MemoryStore()
+  await using db = new MemoryStore()
   let slow = true
   let started!: () => void
   let modelStarted = new Promise<void>((resolve) => {
@@ -559,23 +612,25 @@ it('ends slow runs on deadline and shutdown, releasing the ticket queue', async 
   }
 })
 
-it('completes all five evidence-backed workflows offline', async () => {
+it('completes all seven evidence-backed workflows offline', async () => {
   const { runWorkflowEval, stability } = await import('../src/eval/workflow')
   const report = await runWorkflowEval(false, 3)
   expect(report).toMatchObject({ runs: 3, meanPassRate: 1, passAtK: 1, passAllK: 1 })
-  expect(report.results).toHaveLength(15)
+  expect(report.results).toHaveLength(21)
   for (const task of report.perTask) expect(task.passed).toEqual([true, true, true])
   expect(report.meanPerRun.ms).toBe(report.ms / 3)
-  const mixed = report.results.map(({ task }, i) => ({ task, passed: i % 5 !== 0 && i !== 1 }))
-  expect(stability(mixed)).toMatchObject({ meanPassRate: 11 / 15, passAtK: 4 / 5, passAllK: 3 / 5 })
-  const results = report.results.slice(0, 5)
-  expect(results.map((r) => r.passed)).toEqual([true, true, true, true, true])
-  expect(results.map((r) => r.externalWrites)).toEqual([1, 1, 0, 0, 1])
-})
+  const mixed = report.results.map(({ task }, i) => ({ task, passed: i % 7 !== 0 && i !== 1 }))
+  expect(stability(mixed)).toMatchObject({ meanPassRate: 17 / 21, passAtK: 6 / 7, passAllK: 5 / 7 })
+  const results = report.results.slice(0, 7)
+  expect(results.map((r) => r.passed)).toEqual(Array(7).fill(true))
+  expect(results.map((r) => r.externalWrites)).toEqual([1, 1, 0, 0, 1, 1, 1])
+  expect(results[6].externalRevokes).toBe(1)
+}, 60000)
 
 it('uses ticket ownership and latest observations even for fixture A', async () => {
-  const db = new MemoryStore()
+  await using db = new MemoryStore()
   const ticket = { ...bob, id: crypto.randomUUID(), scenario: 'A' as const }
+  await db.add('tickets', {id:ticket.id, scenario:ticket.scenario, actor_id:bob.actor_id, tenant_id:bob.tenant_id})
   const row = (source: string, data: Record<string, unknown>, observed_at: string) => ({
     ticket_id: ticket.id, id: crypto.randomUUID(), source, data, observed_at,
   })
@@ -606,4 +661,98 @@ it('separates directory, application and raw service observations', () => {
     serviceStatus: { globalOutage: false },
   })
   expect(() => adapter.get_service_events('unbound')).toThrow('Subject unavailable')
+})
+
+it('authenticates tenant event streams and isolates their notifications', async () => {
+  await using db = new MemoryStore()
+  const app = await application(db, randomBytes(32))
+  const ctl = new AbortController()
+  try {
+    expect((await app.inject('/api/events')).statusCode).toBe(401)
+    const origin = await app.listen({ host: '127.0.0.1', port: 0 })
+    const response = await fetch(origin + '/api/events', {
+      headers: { 'x-demo-user': 'alice' }, signal: ctl.signal,
+    })
+    const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader()
+    for (const user of ['guest', 'bob']) {
+      const response = await app.inject({
+        method: 'POST', url: '/api/tickets', headers: { 'x-demo-user': user },
+        payload: { scenario: 'A' },
+      })
+      expect(response.statusCode).toBe(201)
+      if (user === 'bob') {
+        let buffer = ''
+        while (!buffer.includes('data: ') || !buffer.endsWith('\n\n')) {
+          const chunk = await reader.read()
+          if (chunk.done) throw Error('Stream ended before ticket notification')
+          buffer += chunk.value
+        }
+        expect(buffer.split('\n').filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice(6))))
+          .toEqual([{ type: 'ticket', id: response.json().id }])
+      }
+    }
+  } finally {
+    ctl.abort()
+    await app.close()
+  }
+})
+
+it('authenticates signed callers and carries approval traces into metered execution', async () => {
+  await using db = new MemoryStore()
+  const http = permissionServer()
+  const key = randomBytes(32)
+  const app = await application(db, key, undefined, undefined, http.adapter)
+  const { signToken } = await import('../src/http/auth')
+  const token = signToken(bob, key, 60)
+  const headers = { authorization: 'Bearer ' + token }
+  const demo = process.env.ALLOW_DEMO_AUTH
+  try {
+    process.env.ALLOW_DEMO_AUTH = '0'
+    const metrics = () => app.inject({ url: '/api/metrics', headers })
+    expect((await metrics()).statusCode).toBe(200)
+    for (const authorization of [
+      undefined,
+      'Bearer ' + signToken(bob, key, -1),
+      'Bearer ' + token.slice(0, -1) + (token.endsWith('A') ? 'B' : 'A'),
+    ]) {
+      const response = await app.inject({
+        url: '/api/tickets',
+        headers: { ...(authorization && { authorization }), 'x-demo-user': 'bob' },
+      })
+      expect(response.statusCode).toBe(401)
+    }
+    const post = (url: string, payload: object) => app.inject({ method: 'POST', url, payload, headers })
+    const ticket = (await post('/api/tickets', { scenario: 'B' })).json()
+    const run = (
+      await post('/api/tickets/' + ticket.id + '/runs', { message: '调查', client_request_id: 'one' })
+    ).json()
+    await app.inject({ url: '/api/runs/' + run.runId + '/events', headers })
+    const [change] = await db.rows('changes', { ticket_id: ticket.id })
+    const trace = '00-12345678901234567890123456789012-1234567890123456-01'
+    const approved = await app.inject({
+      method: 'POST',
+      url: '/api/changes/' + change.id + '/decision',
+      headers: { authorization: 'Bearer ' + signToken(carol, key, 60), traceparent: trace },
+      payload: { decision: 'approve', payload_hash: change.payload_hash },
+    })
+    expect(approved.statusCode).toBe(200)
+    expect(approved.headers.traceparent).toBe(trace)
+    for (let i = 0; i < 100 && !(await metrics()).json().jobs_succeeded; i++) await Bun.sleep(10)
+    expect(http.traces.slice(-3)).toEqual([trace, trace, trace])
+    expect((await metrics()).json()).toEqual({
+      runs_total: 1,
+      runs_failed: 0,
+      tool_attempts: 6,
+      tool_failures: 0,
+      tokens_total: 0,
+      jobs_succeeded: 1,
+      jobs_revoked: 0,
+      jobs_manual_review: 0,
+    })
+  } finally {
+    if (demo === undefined) delete process.env.ALLOW_DEMO_AUTH
+    else process.env.ALLOW_DEMO_AUTH = demo
+    await app.close()
+    await http.close()
+  }
 })

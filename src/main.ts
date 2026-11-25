@@ -25,7 +25,7 @@ await app.listen({ port: Number(process.env.PORT || 3000), host: '127.0.0.1' })
 console.log('ServiceDesk listening at ' + app.listeningOrigin)
 async function close() {
   await app.close()
-  if (db instanceof PgStore) await db.pool.end()
+  await db.close()
 }
 process.once('SIGTERM', close)
 process.once('SIGINT', close)

@@ -21,9 +21,10 @@ const fresh = (): Ticket => ({
   scenario: 'A',
 })
 it('applies field policy, scoped authenticated encryption, and contextual secret detection', async () => {
-  const db = new MemoryStore(),
-    t = fresh(),
-    v = await Vault.open(db, t, key)
+  await using db = new MemoryStore()
+  const t = fresh()
+  await db.add("tickets", t)
+  const v = await Vault.open(db, t, key)
   const hash = '2b37d91e559c2af96f4a5dd5923a75263777ad00'
   expect(
     await v.project({
@@ -77,7 +78,7 @@ it('applies field policy, scoped authenticated encryption, and contextual secret
   })
 })
 it('filters ACL before ranking and weights exact status code', async () => {
-  const db = new MemoryStore()
+  await using db = new MemoryStore()
   await seed(db)
   await db.add('kb_chunks', {
     id: '503',
@@ -122,6 +123,7 @@ for (const backend of ['memory', 'postgres']) {
       })
       afterAll(async () => {
         await app?.close()
+        if (db instanceof MemoryStore) await db.close()
         await pgdb?.pool.end()
       })
       for (const scenario of ['A', 'B']) {
@@ -206,7 +208,10 @@ for (const backend of ['memory', 'postgres']) {
 }
 
 it('scrubs system prompt, previous messages, tool results and provider error text before transport', async () => {
-  const vault = await Vault.open(new MemoryStore(), fresh(), key)
+  await using db = new MemoryStore()
+  const t = fresh()
+  await db.add("tickets",t)
+  const vault = await Vault.open(db, t, key)
   const raw = 'private@corp.example'
   await vault.bind('EMAIL', raw)
   const { getModel, createAssistantMessageEventStream } =
@@ -285,7 +290,7 @@ it('sends a masked request over the OpenAI-compatible HTTP transport', async () 
   process.env.MODEL_BASE_URL = url + '/v1'
   process.env.MODEL_API_KEY = 'local-test'
   process.env.MODEL_ID = 'desk-test'
-  const db = new MemoryStore()
+  await using db = new MemoryStore()
   const app = await application(
     db,
     key,

@@ -3,7 +3,7 @@ import pg from 'pg'
 import { randomBytes } from 'node:crypto'
 import { Vault } from '../src/privacy/vault'
 import { MemoryStore, PgStore } from '../src/db/store'
-import { compare } from '../src/adapters/demo'
+import { compare, fixture } from '../src/adapters/demo'
 import { application } from '../src/http/app'
 import { mockStream } from '../src/investigation/mock'
 import { privacyReport } from '../src/eval/privacy'
@@ -13,7 +13,9 @@ it('distinguishes aliases, namesakes and missing directory identity', async () =
   const b = { ...a, email: 'two@corp.example', employeeId: 'EMP-202' }
   const auth = { tenant_id: 'demo', actor_id: 'tester', department_id: 'it' }
   const t = { ...auth, id: crypto.randomUUID(), scenario: 'B' as const }
-  const v = await Vault.open(new MemoryStore(), t, randomBytes(32))
+  await using db = new MemoryStore()
+  await db.add('tickets', {id:t.id, actor_id:t.actor_id, tenant_id:t.tenant_id, scenario:t.scenario})
+  const v = await Vault.open(db, t, randomBytes(32))
   const p = await v.project(a),
     q = await v.project(b)
   expect(p.email).not.toBe(q.email)
@@ -154,10 +156,10 @@ it('rejects extra tool fields before reading the adapter', async () => {
   const { createAssistantMessageEventStream } = await import(
     '@mariozechner/pi-ai'
   )
-  const db = new MemoryStore(),
-    auth = { tenant_id: 'test', actor_id: 'tester', department_id: 'it' }
+  await using db = new MemoryStore()
+  const auth = { tenant_id: 'test', actor_id: 'tester', department_id: 'it' }
   const t = { ...auth, scenario: 'A' as const, id: crypto.randomUUID() }
-  await db.add('tickets', t)
+  await db.add('tickets', {id:t.id, actor_id:t.actor_id, tenant_id:t.tenant_id, scenario:t.scenario})
   let rejected = false
   await investigate(
     db,
@@ -182,6 +184,7 @@ it('rejects extra tool fields before reading the adapter', async () => {
       stream.end(msg)
       return stream
     },
+    fixture(t.scenario),
   )
   expect(rejected).toBe(true)
   expect(await db.rows('evidence', { ticket_id: t.id })).toHaveLength(5)
@@ -211,8 +214,8 @@ it('sends reasoning effort through the investigation privacy gateway on both wir
   try {
     const auth = { tenant_id: 'test', actor_id: 'tester', department_id: 'it' }
     const ticket = { ...auth, id: crypto.randomUUID(), scenario: 'B' as const }
-    const db = new MemoryStore()
-    await db.add('tickets', ticket)
+    await using db = new MemoryStore()
+    await db.add('tickets', {id:ticket.id, actor_id:ticket.actor_id, tenant_id:ticket.tenant_id, scenario:ticket.scenario})
     const key = randomBytes(32)
     for (const [host, id] of [
       ['api.deepseek.com', 'deepseek-flash'],
@@ -228,7 +231,7 @@ it('sends reasoning effort through the investigation privacy gateway on both wir
           async () => {},
           (m, c, o) =>
             streamSimple({ ...m, baseUrl: server.url.origin + '/v1' }, c, o),
-          undefined,
+          fixture(ticket.scenario),
           {
             baseUrl: 'https://' + host + '/v1',
             id,
@@ -268,7 +271,9 @@ it('masks raw credential assignments at the gateway while preserving diagnostic 
     id: crypto.randomUUID(),
     scenario: 'B' as const,
   }
-  const vault = await Vault.open(new MemoryStore(), t, randomBytes(32))
+  await using db = new MemoryStore()
+  await db.add('tickets', {id:t.id, actor_id:t.actor_id, tenant_id:t.tenant_id, scenario:t.scenario})
+  const vault = await Vault.open(db, t, randomBytes(32))
   const diagnostic = 'v2.10.4 8443 E403'
   const assignments = [
     'password=a',

@@ -1,9 +1,9 @@
 import { viewer } from './service.js'
 
 export interface PermissionsAdapter {
-  read(key: string, role?: string): Promise<boolean | null>
-  revoke(key: string, role?: string): Promise<void>
-  grant(key: string, role?: string): Promise<void>
+  read(key: string, role?: string, traceparent?: string): Promise<boolean | null>
+  revoke(key: string, role?: string, traceparent?: string): Promise<void>
+  grant(key: string, role?: string, traceparent?: string): Promise<void>
 }
 
 export class HttpPermissions implements PermissionsAdapter {
@@ -14,10 +14,11 @@ export class HttpPermissions implements PermissionsAdapter {
       throw Error('Invalid PERMISSIONS_TIMEOUT_MS')
   }
 
-  private request(url: string, body?: string, method = body === undefined ? 'GET' : 'POST') {
+  private request(url: string, body?: string, method = body === undefined ? 'GET' : 'POST', traceparent?: string) {
     return fetch(url, {
       method,
       headers: {
+        ...(traceparent && { traceparent }),
         ...(this.token && { Authorization: 'Bearer ' + this.token }),
         ...(body && { 'Content-Type': 'application/json' }),
       },
@@ -27,9 +28,9 @@ export class HttpPermissions implements PermissionsAdapter {
     })
   }
 
-  async read(key: string, role = viewer) {
+  async read(key: string, role = viewer, traceparent?: string) {
     try {
-      const response = await this.request(this.endpoint + '?' + new URLSearchParams({ resource_key: key, role }))
+      const response = await this.request(this.endpoint + '?' + new URLSearchParams({ resource_key: key, role }), undefined, 'GET', traceparent)
       if (response.status !== 200) return null
       const data = await response.json()
       return typeof data?.granted === 'boolean' ? data.granted as boolean : null
@@ -38,13 +39,13 @@ export class HttpPermissions implements PermissionsAdapter {
     }
   }
 
-  async revoke(key: string, role = viewer) {
-    const response = await this.request(this.endpoint + '?' + new URLSearchParams({ resource_key: key, role }), undefined, 'DELETE')
+  async revoke(key: string, role = viewer, traceparent?: string) {
+    const response = await this.request(this.endpoint + '?' + new URLSearchParams({ resource_key: key, role }), undefined, 'DELETE', traceparent)
     if (!response.ok) throw Error('Revoke failed: HTTP ' + response.status)
   }
 
-  async grant(key: string, role = viewer) {
-    const response = await this.request(this.endpoint, JSON.stringify({ resource_key: key, role }))
+  async grant(key: string, role = viewer, traceparent?: string) {
+    const response = await this.request(this.endpoint, JSON.stringify({ resource_key: key, role }), 'POST', traceparent)
     if (!response.ok) throw Error('Grant failed: HTTP ' + response.status)
   }
 }

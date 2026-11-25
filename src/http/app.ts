@@ -1,13 +1,20 @@
+import { TenantScope } from '../db/tenant.js'
+import { Metrics } from './metrics.js'
+import { traceparent } from './trace.js'
+import { verifyToken } from './auth.js'
+import type { FastifyRequest } from 'fastify'
 import type { PermissionsAdapter } from '../changes/permissions.js'
 import { DemoPermissions, Executor } from '../changes/executor.js'
 import { draft, decide, privileged } from '../changes/service.js'
-import Fastify from 'fastify'
+import Fastify, { LogController } from 'fastify'
 import { createHash } from 'node:crypto'
-import { setTimeout as delay } from 'node:timers/promises'
+import { events, listenChanges, notify } from './events.js'
 import type { StreamFn } from '@mariozechner/pi-agent-core'
+import { PgStore } from '../db/store.js'
 import type { Auth, Store, Run, Ticket, Event } from '../db/store.js'
 import { seed } from '../retrieval/lexical.js'
 import { Type } from 'typebox'
+import type { InvestigationSource } from '../adapters/source.js'
 import { fixture } from '../adapters/demo.js'
 import { appName, viewer } from '../changes/service.js'
 import type { Change } from '../changes/types.js'
@@ -25,13 +32,9 @@ const users = new Map<string, Auth>([
   ],
   ['alice', { tenant_id: 'demo', actor_id: 'alice', department_id: 'it' }],
   ['bob', { tenant_id: 'demo', actor_id: 'bob', department_id: 'it' }],
-  [
-    'guest',
-    { tenant_id: 'other', actor_id: 'guest', department_id: 'finance' },
-  ],
+  ['guest', { tenant_id: 'other', actor_id: 'guest', department_id: 'finance' }],
 ])
-const demoAuth = (id: unknown) =>
-  typeof id === 'string' ? users.get(id) : undefined
+const demoAuth = (id: unknown) => (typeof id === 'string' ? users.get(id) : undefined)
 export async function application(
   db: Store,
   key: Buffer,
@@ -40,86 +43,131 @@ export async function application(
   permissions: PermissionsAdapter = new DemoPermissions(db),
 ) {
   const app = Fastify({
+    logger: {
+      level:
+        process.env.LOG_LEVEL ??
+        ([process.env.NODE_ENV, process.env.BUN_ENV].includes('test') ? 'silent' : 'info'),
+      serializers: {
+        err: () => ({ type: 'Error', message: 'Request failed', stack: '' }),
+        req: () => ({}),
+        res: (r) => ({ statusCode: r.statusCode }),
+      },
+    },
+    logController: new LogController({ disableRequestLogging: true, requestIdLogLabel: 'traceparent' }),
+    genReqId: (req) => traceparent(req.headers.traceparent),
+    requestIdHeader: false,
     bodyLimit: 32_768,
     ajv: { customOptions: { removeAdditional: false, coerceTypes: false } },
   })
+  app.addHook('onRequest', async (req, reply) => {
+    reply.header('traceparent', req.id)
+  })
+  app.addHook('onResponse', async (req, reply) => {
+    req.log.info({ statusCode: reply.statusCode }, 'Request completed')
+  })
+  const metrics = new Metrics()
   await seed(db)
   // A single process owns every investigation. Close interrupted event streams
   // after a restart so reconnecting subscribers receive a terminal event.
-  for (const run of await db.rows('runs', {})) {
-    const events = await db.rows('run_events', { run_id: run.id })
-    if (!events.some((e) => ['final', 'error'].includes(e.data.type))) {
-      await db.add('run_events', {
-        run_id: run.id,
-        seq: events.reduce((max, e) => Math.max(max, e.seq), 0) + 1,
-        data: { type: 'error', text: '服务已重启，请发起新一轮调查。' },
-      })
-    }
-  }
+  await db.query(
+    `INSERT INTO run_events(run_id, seq, data)
+    SELECT r.id, coalesce(max(e.seq),0)+1, $1::jsonb FROM runs r
+    LEFT JOIN run_events e ON e.run_id=r.id GROUP BY r.id
+    HAVING NOT coalesce(bool_or(e.data->>'type' IN ('final','error')),false)`,
+    [JSON.stringify({ type: 'error', text: '服务已重启，请发起新一轮调查。' })],
+  )
+  const bus = events(db)
   const shutdown = new AbortController()
   app.addHook('preClose', async () => shutdown.abort())
   const queues = new Map<string, Promise<void>>()
   const scope = (a: Auth) => ({ tenant_id: a.tenant_id, actor_id: a.actor_id })
-  const fail = (statusCode: number, message: string) =>
-    Object.assign(Error(message), { statusCode })
-  const owner = (header: unknown) => {
-    const a = authenticate(header)
+  const fail = (statusCode: number, message: string) => Object.assign(Error(message), { statusCode })
+  const owner = (req: FastifyRequest) => {
+    const a =
+      req.headers.authorization !== undefined
+        ? verifyToken(req.headers.authorization, key)
+        : process.env.ALLOW_DEMO_AUTH !== '0'
+          ? authenticate(req.headers['x-demo-user'])
+          : undefined
     if (!a) throw fail(401, 'Unknown identity')
     return a
   }
   async function ticket(id: string, a: Auth) {
-    if (!/^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i.test(id))
-      throw fail(404, 'Unknown ticket')
-    const [t] = await db.rows('tickets', { ...scope(a), id })
+    if (!/^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i.test(id)) throw fail(404, 'Unknown ticket')
+    const [t] = await new TenantScope(db, a.tenant_id).rows('tickets', { actor_id: a.actor_id, id })
     if (!t) throw fail(404, 'Unknown ticket')
     return t
   }
-  const executor = new Executor(db, permissions)
+  const executor = new Executor(db, permissions, undefined, (tenant, action) => {
+    metrics.for(tenant)[`jobs_${action}`]++
+  })
   let active: Promise<void> | undefined
+  let pending = false
+  let timer: NodeJS.Timeout | undefined
   const wake = () => {
-    active ??= executor
+    if (shutdown.signal.aborted) return
+    clearTimeout(timer)
+    if (active) {
+      pending = true
+      return
+    }
+    active = executor
       .run()
-      .catch(() => app.log.error('Change executor scan failed'))
+      .then(async () => {
+        const [next] = await db.query<{
+          due: string | null
+        }>(`SELECT min(CASE WHEN status='running'
+        THEN lease_until ELSE run_at END) AS due FROM jobs j WHERE status IN ('running','queued')
+        AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resource_key=j.resource_key AND s.id<>j.id
+          AND s.status IN ('running','manual_review'))`)
+        const delay = Math.min(
+          next.due ? Math.max(1, Date.parse(next.due) - Date.now()) : Infinity,
+          db instanceof PgStore ? 30_000 : Infinity,
+        )
+        if (Number.isFinite(delay)) timer = setTimeout(wake, Math.min(delay, 2_147_483_647)).unref()
+      })
+      .catch(() => {
+        app.log.error('Change executor scan failed')
+        timer = setTimeout(wake, 5000).unref()
+      })
       .finally(() => {
         active = undefined
+        if (pending) {
+          pending = false
+          wake()
+        }
       })
   }
-  const timer = setInterval(wake, 1000)
-  timer.unref()
+  const stopListening = db instanceof PgStore ? await listenChanges(db) : undefined
+  bus.on('jobs', wake)
   wake()
   const idParams = Type.Object({ id: Type.String() })
   const body = (fields: Parameters<typeof Type.Object>[0]) =>
     Type.Object(fields, { additionalProperties: false })
   const visible = (c: Change, a: Auth) =>
     c.tenant_id === a.tenant_id &&
-    (privileged(a) ||
-      a.actor_id === c.requester_id ||
-      a.actor_id === c.beneficiary_principal)
-  const sessions = new Map<string, 'normal' | 'wrong_account'>()
+    (privileged(a) || a.actor_id === c.requester_id || a.actor_id === c.beneficiary_principal)
+  app.get('/api/metrics', async (req) => ({ ...metrics.for(owner(req).tenant_id) }))
   const local = () => {
-    if (!(permissions instanceof DemoPermissions))
-      throw fail(404, 'Demo controls unavailable')
+    if (!(permissions instanceof DemoPermissions)) throw fail(404, 'Demo controls unavailable')
     return permissions
   }
   app.get('/api/changes', async (req) => {
-    const a = owner(req.headers['x-demo-user'])
-    return (await db.rows('changes', { tenant_id: a.tenant_id })).filter((c) =>
-      visible(c, a),
-    )
+    const a = owner(req)
+    return new TenantScope(db, a.tenant_id).visibleChanges(a.actor_id, privileged(a))
   })
   app.get<{ Params: { id: string } }>(
     '/api/changes/:id/audit',
     { schema: { params: idParams } },
     async (req) => {
-      const a = owner(req.headers['x-demo-user'])
+      const a = owner(req)
       if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(req.params.id))
         throw fail(404, 'Unknown change')
-      const [c] = await db.rows('changes', {
+      const [c] = await new TenantScope(db, a.tenant_id).rows('changes', {
         id: req.params.id,
-        tenant_id: a.tenant_id,
       })
       if (!c || !visible(c, a)) throw fail(404, 'Unknown change')
-      return (await db.rows('change_audit', { change_id: c.id })).sort((a, b) =>
+      return (await new TenantScope(db, a.tenant_id).children('change_audit', c.id)).sort((a, b) =>
         a.created_at.localeCompare(b.created_at),
       )
     },
@@ -133,23 +181,21 @@ export async function application(
       schema: {
         params: idParams,
         body: body({
-          session: Type.Union([
-            Type.Literal('normal'),
-            Type.Literal('wrong_account'),
-          ]),
+          session: Type.Union([Type.Literal('normal'), Type.Literal('wrong_account')]),
         }),
       },
     },
     async (req) => {
-      const t = await ticket(req.params.id, owner(req.headers['x-demo-user']))
+      const t = await ticket(req.params.id, owner(req))
       local()
       if (t.scenario !== 'B') throw fail(400, 'Scenario B required')
-      sessions.set(t.id, req.body.session)
+      await new TenantScope(db, t.tenant_id).setSession(t.id, req.body.session)
+      notify(db, t.tenant_id, 'ticket', t.id)
       return req.body
     },
   )
   app.get('/api/demo/fault', async (req) => {
-    owner(req.headers['x-demo-user'])
+    owner(req)
     return { fault: local().fault ?? 'none' }
   })
   app.post<{ Body: { fault: 'none' | 'unknown_external_state' } }>(
@@ -157,17 +203,15 @@ export async function application(
     {
       schema: {
         body: body({
-          fault: Type.Union([
-            Type.Literal('none'),
-            Type.Literal('unknown_external_state'),
-          ]),
+          fault: Type.Union([Type.Literal('none'), Type.Literal('unknown_external_state')]),
         }),
       },
     },
     async (req) => {
-      const a = owner(req.headers['x-demo-user'])
+      const a = owner(req)
       if (a.tenant_id !== 'demo') throw fail(403, 'Demo tenant required')
       local().fault = req.body.fault === 'none' ? undefined : req.body.fault
+      notify(db, a.tenant_id, 'fault')
       return req.body
     },
   )
@@ -181,14 +225,12 @@ export async function application(
           app: Type.String(),
           role: Type.String(),
           reason: Type.String(),
-          ttl_minutes: Type.Optional(
-            Type.Number({ exclusiveMinimum: 0, maximum: 10080 }),
-          ),
+          ttl_minutes: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 10080 })),
         }),
       },
     },
     async (req, reply) => {
-      const a = owner(req.headers['x-demo-user'])
+      const a = owner(req)
       return reply.code(201).send(await draft(db, a, req.body))
     },
   )
@@ -206,18 +248,12 @@ export async function application(
         },
       },
       async (req) => {
-        if (
-          !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(req.params.id)
-        )
+        if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(req.params.id))
           throw fail(404, 'Unknown change')
-        const result = await decide(
-          db,
-          owner(req.headers['x-demo-user']),
-          req.params.id,
-          req.body,
-          path === 'resolve',
-        )
-        wake()
+        const auth = owner(req)
+        const result = await decide(db, auth, req.params.id, req.body, path === 'resolve', req.id)
+        if (path === 'resolve' && (result.status === 'succeeded' || result.status === 'revoked'))
+          metrics.for(auth.tenant_id)[`jobs_${result.status}`]++
         return result
       },
     )
@@ -237,45 +273,41 @@ export async function application(
       },
     },
     async (req, reply) => {
-      const a = owner(req.headers['x-demo-user'])
-      if (!['A', 'B'].includes(req.body?.scenario))
-        throw fail(400, 'Invalid scenario')
+      const a = owner(req)
+      if (!['A', 'B'].includes(req.body?.scenario)) throw fail(400, 'Invalid scenario')
       const t = {
         id: crypto.randomUUID(),
         ...scope(a),
         scenario: req.body.scenario,
       }
-      await db.add('tickets', t)
+      await new TenantScope(db, a.tenant_id).add('tickets', t)
+      notify(db, t.tenant_id, 'ticket', t.id)
       return reply.code(201).send(t)
     },
   )
-  app.get('/api/tickets', (req) =>
-    db.rows('tickets', scope(owner(req.headers['x-demo-user']))),
-  )
-  app.get<{ Params: { id: string } }>(
-    '/api/tickets/:id',
-    { schema: { params: idParams } },
-    async (req) => {
-      const t = await ticket(req.params.id, owner(req.headers['x-demo-user']))
-      const changes = await db.rows('changes', {
-        tenant_id: t.tenant_id,
-        ticket_id: t.id,
-      })
-      return {
-        ...t,
-        changes,
-        session: sessions.get(t.id) ?? 'normal',
-        demo: permissions instanceof DemoPermissions,
-        evidence: (await db.rows('evidence', { ticket_id: t.id })).map((e) => ({
-          ...e,
-          stale: staleEvidence(e, changes),
-        })),
-        runs: (await db.rows('runs', { ticket_id: t.id })).sort((a, b) =>
-          a.created_at.localeCompare(b.created_at),
-        ),
-      }
-    },
-  )
+  app.get('/api/tickets', (req) => {
+    const a = owner(req)
+    return new TenantScope(db, a.tenant_id).rows('tickets', { actor_id: a.actor_id })
+  })
+  app.get<{ Params: { id: string } }>('/api/tickets/:id', { schema: { params: idParams } }, async (req) => {
+    const t = await ticket(req.params.id, owner(req))
+    const tenant = new TenantScope(db, t.tenant_id)
+    const changes = await tenant.rows('changes', { ticket_id: t.id })
+    const watermark = await tenant.permissionWatermark(t.id)
+    return {
+      ...t,
+      changes,
+      session: t.session ?? 'normal',
+      demo: permissions instanceof DemoPermissions,
+      evidence: (await tenant.children('evidence', t.id)).map((e) => ({
+        ...e,
+        stale: staleEvidence(e, watermark, t.session_updated_at),
+      })),
+      runs: (await tenant.rows('runs', { ticket_id: t.id })).sort((a, b) =>
+        a.created_at.localeCompare(b.created_at),
+      ),
+    }
+  })
   app.post<{
     Params: { id: string }
     Body: { message: string; client_request_id: string }
@@ -291,7 +323,7 @@ export async function application(
       },
     },
     async (req, reply) => {
-      const a = owner(req.headers['x-demo-user']),
+      const a = owner(req),
         t = await ticket(req.params.id, a)
       const { message, client_request_id } = req.body ?? {}
       if (
@@ -303,13 +335,12 @@ export async function application(
         throw fail(400, 'Missing message or client_request_id')
       const filter = { ...scope(a), ticket_id: t.id, client_request_id }
       const fingerprint = createHash('sha256').update(message).digest('hex')
-      const { run, created } = await db.locked(
+      const { run, created } = await new TenantScope(db, a.tenant_id).locked(
         'request:' + t.id,
         async (tx) => {
           const [existing] = await tx.rows('runs', filter)
           if (existing) {
-            if (existing.request_fingerprint !== fingerprint)
-              throw fail(409, 'Request content changed')
+            if (existing.request_fingerprint !== fingerprint) throw fail(409, 'Request content changed')
             return { run: existing, created: false }
           }
           const run: Run = {
@@ -323,34 +354,43 @@ export async function application(
         },
       )
       if (created) {
+        metrics.for(a.tenant_id).runs_total++
         let seq = 0
-        const emit = (data: Event['data']) =>
-          db.add('run_events', { run_id: run.id, seq: ++seq, data })
+        const emit = async (data: Event['data']) => {
+          await new TenantScope(db, a.tenant_id).addChild('run_events', {
+            run_id: run.id,
+            seq: ++seq,
+            data,
+          })
+          bus.emit('run:' + run.id)
+          if (['final', 'error'].includes(data.type)) notify(db, t.tenant_id, 'ticket', t.id)
+        }
         const task = (queues.get(t.id) ?? Promise.resolve())
           .catch(() => {})
           .then(async () => {
             try {
               await emit({ type: 'started' })
-              let demoFixture
-              if (
-                t.scenario === 'B' &&
-                permissions instanceof DemoPermissions
-              ) {
-                const wrong = sessions.get(t.id) === 'wrong_account'
-                const granted = await permissions.read(
-                  JSON.stringify([a.tenant_id, appName, 'bob']),
-                  viewer,
-                )
-                demoFixture = fixture('B', {
-                  webStatus: granted ? 200 : 403,
-                  desktopStatus: !wrong && granted ? 200 : 403,
-                  ...(wrong && {
-                    principal: 'external-71',
-                    sessionEmail: 'other@personal.example',
-                  }),
-                })
+              const source: InvestigationSource = fixture(t.scenario)
+              if (t.scenario === 'B' && permissions instanceof DemoPermissions) {
+                const current = await ticket(t.id, a)
+                source.sessionUpdatedAt = current.session_updated_at ?? undefined
+                source.get_login_sessions = async (email) => {
+                  const wrong = (await ticket(t.id, a)).session === 'wrong_account'
+                  const granted = await permissions.read(
+                    JSON.stringify([a.tenant_id, appName, 'bob']),
+                    viewer,
+                  )
+                  return fixture('B', {
+                    webStatus: granted ? 200 : 403,
+                    desktopStatus: !wrong && granted ? 200 : 403,
+                    ...(wrong && {
+                      principal: 'external-71',
+                      sessionEmail: 'other@personal.example',
+                    }),
+                  }).get_login_sessions(email)
+                }
               }
-              await investigate(
+              const usage = await investigate(
                 db,
                 a,
                 t,
@@ -358,13 +398,18 @@ export async function application(
                 key,
                 emit,
                 transport,
-                demoFixture,
+                source,
                 undefined,
                 true,
                 { signal: shutdown.signal },
                 permissions,
+                req.id,
               )
+              metrics.usage(a.tenant_id, usage)
             } catch (err) {
+              metrics.for(a.tenant_id).runs_failed++
+              if (err instanceof Error && 'usage' in err)
+                metrics.usage(a.tenant_id, err.usage as Awaited<ReturnType<typeof investigate>>)
               await emit({
                 type: 'error',
                 text:
@@ -388,41 +433,86 @@ export async function application(
     '/api/runs/:runId/events',
     { schema: { params: Type.Object({ runId: Type.String() }) } },
     async (req, reply) => {
-      const a = owner(req.headers['x-demo-user']),
+      const a = owner(req),
         id = req.params.runId
       if (
         !/^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i.test(id) ||
-        !(await db.rows('runs', { ...scope(a), id })).length
+        !(await new TenantScope(db, a.tenant_id).rows('runs', { actor_id: a.actor_id, id })).length
       )
         throw fail(404, 'Unknown run')
       let cursor = Number(req.headers['last-event-id'] ?? 0)
-      if (!Number.isSafeInteger(cursor) || cursor < 0)
-        throw fail(400, 'Invalid event cursor')
+      if (!Number.isSafeInteger(cursor) || cursor < 0) throw fail(400, 'Invalid event cursor')
       reply.hijack()
       reply.raw.writeHead(200, {
+        traceparent: req.id,
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
       })
-      while (!reply.raw.destroyed) {
-        const events = (await db.rows('run_events', { run_id: id })).sort(
-          (a, b) => a.seq - b.seq,
-        )
-        for (const e of events)
-          if (e.seq > cursor) {
-            reply.raw.write(
-              'id: ' + e.seq + '\ndata: ' + JSON.stringify(e.data) + '\n\n',
-            )
-            cursor = e.seq
-          }
-        if (events.some((e) => ['final', 'error'].includes(e.data.type))) break
-        await delay(100)
+      const tenant = new TenantScope(db, a.tenant_id)
+      const channel = 'run:' + id
+      let dirty = true,
+        reading = false,
+        closed = false
+      const end = () => {
+        closed = true
+        bus.off(channel, wakeRun)
+        shutdown.signal.removeEventListener('abort', end)
+        reply.raw.end()
       }
-      reply.raw.end()
+      async function wakeRun() {
+        dirty = true
+        if (reading || closed) return
+        reading = true
+        try {
+          do {
+            dirty = false
+            const batch = await tenant.replay(id, cursor)
+            for (const e of batch) {
+              if (closed) return
+              reply.raw.write('id: ' + e.seq + '\ndata: ' + JSON.stringify(e.data) + '\n\n')
+              cursor = e.seq
+              if (['final', 'error'].includes(e.data.type)) return end()
+            }
+            if (!batch.length && cursor && (await tenant.ended(id, cursor))) return end()
+          } while (dirty && !closed)
+        } catch {
+          end()
+        } finally {
+          reading = false
+        }
+      }
+      bus.on(channel, wakeRun)
+      reply.raw.once('close', end)
+      shutdown.signal.addEventListener('abort', end)
+      await wakeRun()
     },
   )
+  app.get('/api/events', async (req, reply) => {
+    const channel = 'tenant:' + owner(req).tenant_id
+    reply.hijack()
+    reply.raw.writeHead(200, {
+      traceparent: req.id,
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+    })
+    const send = (event: unknown) => reply.raw.write('data: ' + JSON.stringify(event) + '\n\n')
+    bus.on(channel, send)
+    reply.raw.write(': connected\n\n')
+    const heartbeat = setInterval(() => reply.raw.write(': heartbeat\n\n'), 15000)
+    const end = () => {
+      bus.off(channel, send)
+      clearInterval(heartbeat)
+      shutdown.signal.removeEventListener('abort', end)
+      reply.raw.end()
+    }
+    reply.raw.once('close', end)
+    shutdown.signal.addEventListener('abort', end)
+  })
   app.addHook('onClose', async () => {
-    clearInterval(timer)
+    bus.off('jobs', wake)
+    await stopListening?.()
     await active
+    clearTimeout(timer)
     await Promise.allSettled(queues.values())
   })
   return app

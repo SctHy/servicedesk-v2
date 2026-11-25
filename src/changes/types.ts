@@ -26,6 +26,7 @@ export type Change = {
   updated_at: string
 }
 export type Job = {
+  traceparent?: string | null
   id: string
   tenant_id: string
   change_id: string
