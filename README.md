@@ -39,6 +39,23 @@ openssl rand -base64 32
 
 把生成的密钥填入 .env 的 MASK_KEY 并持续保管。bun run start 自动迁移并载入知识库。默认使用 Mock。显式设置 LIVE_MODEL=1 才会联网；默认联网模型为 OpenAI `gpt-6.2-sol`（`https://api.openai.com/v1`，推理档位默认 `low`），只需填写 `MODEL_API_KEY`，也可覆盖 `MODEL_BASE_URL`（含 /v1）与 `MODEL_ID` 调用其他支持工具调用的兼容服务。
 
+## Nginx 双实例负载均衡部署
+
+`docker compose up -d` 默认仅启动 PostgreSQL。要在本机通过 Nginx 访问两个共享 PostgreSQL 的 API 实例，运行：
+
+```sh
+docker compose --profile ha up -d --build
+for i in 1 2 3 4; do
+  curl -fsS -D - -o /dev/null http://127.0.0.1:8080/healthz | grep -i '^X-Upstream-Addr:'
+done
+```
+
+打开 http://127.0.0.1:8080 。响应头应出现两个不同的上游地址。两个实例共用 `MASK_KEY`，内置默认值仅供本地演示。用 bob 创建案例 B 并发起调查，在浏览器网络面板查看调查的 `/events` 请求，事件应逐条到达，直至 `final`。也可在终端订阅租户事件流，观察立即返回的 `: connected` 和每 15 秒到达的心跳：
+
+```sh
+curl -NsS -H 'x-demo-user: bob' http://127.0.0.1:8080/api/events
+```
+
 ## 接口
 
 GET /healthz 与 GET /api/demo/scenarios 公开。其余接口优先校验由服务端使用 MASK_KEY 签发的 HMAC-SHA256 Bearer Token。演示模式也接受 x-demo-user（alice、bob、carol 或 guest）。设置 ALLOW_DEMO_AUTH=0 可关闭演示头。

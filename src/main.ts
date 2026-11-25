@@ -21,7 +21,7 @@ if (db instanceof PgStore) await db.migrate()
 const app = await application(db, key, undefined, undefined, configuredPermissions())
 if (existsSync('web/dist/index.html'))
   await app.register(serve, { root: resolve('web/dist') })
-await app.listen({ port: Number(process.env.PORT || 3000), host: '127.0.0.1' })
+await app.listen({ port: Number(process.env.PORT || 3000), host: process.env.HOST || '127.0.0.1' })
 console.log('ServiceDesk listening at ' + app.listeningOrigin)
 async function close() {
   await app.close()
