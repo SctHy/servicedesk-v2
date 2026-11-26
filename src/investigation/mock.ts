@@ -4,16 +4,21 @@ import {
   type Context,
 } from '@mariozechner/pi-ai'
 import type { StreamFn } from '@mariozechner/pi-agent-core'
-export function mockStream(capture?: (ctx: Context) => void): StreamFn {
+export function mockStream(capture?: (ctx: Context) => void, usage?: AssistantMessage['usage']): StreamFn {
   return (model, ctx) => {
     capture?.(structuredClone(ctx))
-    const user = ctx.messages.findLast((m) => m.role === 'user')!
-    const input = JSON.parse(
-      typeof user.content === 'string'
-        ? user.content
-        : (user.content[0] as { text: string }).text,
-    )
-    const facts = [...input.evidence]
+    const input = { scope: '', ref: '', question: '' }
+    const facts: { source: string; evidenceId?: string; data: any }[] = []
+    for (const m of ctx.messages) {
+      if (m.role !== 'user') continue
+      const text = typeof m.content === 'string' ? m.content : m.content[0]?.type === 'text' ? m.content[0].text : ''
+      let item
+      try { item = JSON.parse(text) } catch { input.question = text; continue }
+      if (!item || typeof item !== 'object') continue
+      if (typeof item.scope === 'string') Object.assign(input, { scope: item.scope, ref: item.ref })
+      if (typeof item.question === 'string') input.question = item.question
+      if (Array.isArray(item.evidence)) facts.push(...item.evidence)
+    }
     for (const m of ctx.messages)
       if (
         m.role === 'toolResult' &&
@@ -34,10 +39,10 @@ export function mockStream(capture?: (ctx: Context) => void): StreamFn {
       .filter((e) => e.evidenceId)
       .map((e) => '[' + e.evidenceId + ']')
       .join(' ')
-    const session = facts.findLast((e) => e.source === 'get_login_sessions')
-    const perms = facts.findLast((e) => e.source === 'get_app_permissions')
-    const profile = facts.findLast((e) => e.source === 'get_directory_profile')
-    const events = facts.findLast((e) => e.source === 'get_service_events')
+    const session = facts.findLast((e) => e.source === 'get_login_sessions')!
+    const perms = facts.findLast((e) => e.source === 'get_app_permissions')!
+    const profile = facts.findLast((e) => e.source === 'get_directory_profile')!
+    const events = facts.findLast((e) => e.source === 'get_service_events')!
     const draft = ctx.tools?.find((t) => t.name === 'draft_access_change')
     if (
       !missing.length &&
@@ -108,7 +113,7 @@ export function mockStream(capture?: (ctx: Context) => void): StreamFn {
       provider: model.provider,
       model: model.id,
       timestamp: Date.now(),
-      usage: {
+      usage: usage ?? {
         input: 0,
         output: 0,
         cacheRead: 0,
@@ -132,7 +137,12 @@ export function mockStream(capture?: (ctx: Context) => void): StreamFn {
         : [{ type: 'text', text: report }],
     }
     const stream = createAssistantMessageEventStream()
-    stream.push({ type: 'start', partial: msg })
+    stream.push({ type: 'start', partial: { ...msg, content: [] } })
+    if (!missing.length) {
+      stream.push({ type: 'text_start', contentIndex: 0, partial: { ...msg, content: [{ type: 'text', text: '' }] } })
+      stream.push({ type: 'text_delta', contentIndex: 0, delta: report, partial: msg })
+      stream.push({ type: 'text_end', contentIndex: 0, content: report, partial: msg })
+    }
     stream.push({
       type: 'done',
       reason: missing.length ? 'toolUse' : 'stop',

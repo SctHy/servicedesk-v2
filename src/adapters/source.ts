@@ -28,3 +28,8 @@ export interface InvestigationSource {
     serviceStatus?: { globalOutage: boolean }
   }>
 }
+
+export const evidenceSources = new Map<string, { invalidatedBy: readonly string[] }>([
+  ['get_app_permissions', { invalidatedBy: ['access_state'] }],
+  ['get_login_sessions', { invalidatedBy: ['access_state', 'session_state'] }],
+])

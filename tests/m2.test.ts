@@ -404,3 +404,141 @@ it('distinguishes admin questions and reported requests from endorsements', asyn
   expect(compliant(refusal, true)).toBe(false)
   expect(compliant(refusal, false, 1)).toBe(false)
 })
+
+it('overlaps read calls, fences a mixed draft batch and normalizes executed errors', async () => {
+  const { investigate } = await import('../src/investigation/engine')
+  const { createAssistantMessageEventStream } = await import('@mariozechner/pi-ai')
+  const auth = { tenant_id: 'test', actor_id: 'tester', department_id: 'it' }
+  const ticket = { id: crypto.randomUUID(), tenant_id: auth.tenant_id, actor_id: auth.actor_id, scenario: 'B' as const }
+  await using db = new MemoryStore()
+  await db.add('tickets', ticket)
+  const base = fixture('B')
+  let readers = 0, peak = 0, turns = 0, serviceReads = 0
+  async function read<T>(value: T) {
+    peak = Math.max(peak, ++readers)
+    await Bun.sleep(20)
+    readers--
+    return value
+  }
+  const adapter = {
+    ...base,
+    get_login_sessions: (email: string) => read(base.get_login_sessions(email)),
+    get_app_permissions: (email: string) => read(base.get_app_permissions(email)),
+    get_directory_profile: (email: string) => read(base.get_directory_profile(email)),
+    get_service_events() { serviceReads++; throw Error('internal adapter detail') },
+  }
+  const progress: string[] = []
+  const failures: string[] = []
+  const delays: number[] = []
+  const sessions: (string | undefined)[] = []
+  const usage = await investigate(db, auth, ticket, '调查', randomBytes(32), async e => {
+    if (e.type === 'tool_progress') progress.push(e.source + '/' + e.status)
+  }, async (model, ctx, options) => {
+    turns++
+    delays.push(options!.maxRetryDelayMs!)
+    sessions.push(options?.sessionId)
+    const readArgs = { scope: ticket.id, ref: '[EMAIL_1]' }
+    const call = (name: string, args: Record<string, string> = readArgs) =>
+      ({ type: 'toolCall' as const, name, id: crypto.randomUUID(), arguments: args })
+    const calls = turns === 1 ? [
+      call('get_login_sessions'), call('get_app_permissions'),
+      call('get_service_events', { ...readArgs, scope: 'foreign' }),
+    ] : turns === 2 ? [
+      call('get_directory_profile'), call('draft_access_change', { role: 'project-b:viewer' }),
+      call('get_service_events'),
+    ] : []
+    if (turns === 3) for (const m of ctx.messages)
+      if (m.role === 'toolResult' && m.isError && m.content[0].type === 'text') failures.push(m.content[0].text)
+    const stream = createAssistantMessageEventStream()
+    const reason = calls.length ? 'toolUse' as const : 'stop' as const
+    const msg = {
+      role: 'assistant' as const, api: model.api, provider: model.provider, model: model.id,
+      timestamp: Date.now(), stopReason: reason, content: calls,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    }
+    stream.push({ type: 'done', reason, message: msg })
+    stream.end(msg)
+    return stream
+  }, adapter, {}, true, { timeoutMs: 5000 })
+  expect(peak).toBe(2)
+  expect(progress.slice(-6)).toEqual([
+    'get_directory_profile/running', 'get_directory_profile/done',
+    'draft_access_change/running', 'draft_access_change/done',
+    'get_service_events/running', 'get_service_events/failed',
+  ])
+  expect(serviceReads).toBe(1)
+  expect(failures).toEqual(['Invalid scoped reference', 'Tool execution failed'])
+  expect(usage).toMatchObject({ toolAttempts: 6, toolFailures: 2 })
+  expect(sessions).toEqual(Array(3).fill(ticket.id))
+  expect(delays.every(delay => delay > 0 && delay <= 5000)).toBe(true)
+  expect(delays.at(-1)!).toBeLessThan(delays[0])
+})
+
+it('checks payload hook replacements and in-place edits and forwards stream options', async () => {
+  const { createAssistantMessageEventStream, getModel } = await import('@mariozechner/pi-ai')
+  const model = getModel('openai', 'gpt-4o-mini')
+  await using db = new MemoryStore()
+  const ticket = { id: crypto.randomUUID(), tenant_id: 'test', actor_id: 'tester', scenario: 'A' as const }
+  await db.add('tickets', ticket)
+  const vault = await Vault.open(db, ticket, randomBytes(32))
+  const options = {
+    sessionId: ticket.id, maxRetryDelayMs: 18, timeoutMs: 30, maxRetries: 2,
+    cacheRetention: 'long' as const, transport: 'sse' as const, thinkingBudgets: { low: 100 },
+    onResponse: () => {},
+  }
+  const send = vault.gateway(async (_, __, opts) => {
+    expect(opts).toMatchObject(options)
+    await opts!.onPayload!({ safe: 'yes' }, model)
+    return createAssistantMessageEventStream()
+  })
+  await send(model, { messages: [] }, { ...options, onPayload: () => ({ safe: 'updated' }) })
+  const raw = 'private@example.org'
+  for (const onPayload of [
+    () => ({ text: raw }),
+    (body: unknown) => { Object.assign(body as object, { text: raw }) },
+  ]) await expect(send(model, { messages: [] }, { ...options, onPayload })).rejects.toThrow('privacy')
+})
+
+it('ends through Pi after ten transport calls when the model keeps requesting tools', async () => {
+  const { investigate } = await import('../src/investigation/engine')
+  const auth = { tenant_id: 'test', actor_id: 'tester', department_id: 'it' }
+  const ticket = { id: crypto.randomUUID(), tenant_id: auth.tenant_id, actor_id: auth.actor_id, scenario: 'A' as const }
+  await using db = new MemoryStore()
+  await db.add('tickets', ticket)
+  let calls = 0
+  const events: string[] = []
+  const looping = mockStream()
+  const run = investigate(db, auth, ticket, '调查', randomBytes(32), async e => { events.push(e.type) },
+    (model, ctx, opts) => {
+      calls++
+      return looping(model, {
+        ...ctx, messages: ctx.messages.slice(0, 1),
+        tools: ctx.tools?.filter(t => t.name === 'get_directory_profile'),
+      }, opts)
+    }, fixture('A'))
+  await expect(run).rejects.toMatchObject({ usage: { toolAttempts: 10, toolFailures: 0 } })
+  expect(calls).toBe(10)
+  expect(events.filter(e => e === 'model')).toHaveLength(10)
+  expect(events).not.toContain('final')
+})
+
+it('resolves Pi registry models, clamps reasoning and prices cached tokens', async () => {
+  const { getModels } = await import('@mariozechner/pi-ai')
+  const { modelTransport, recordUsage, usageCounters, reasoningLevel } = await import('../src/model/transport')
+  for (const provider of ['anthropic', 'google', 'openai'] as const) {
+    const builtin = getModels(provider)[0]
+    expect(modelTransport({ provider, id: builtin.id }).model).toEqual(builtin)
+  }
+  expect(modelTransport({ reasoning: 'off' }).thinkingLevel).toBe('low')
+  const { model, thinkingLevel } = modelTransport({ provider: 'openai', id: 'gpt-4o-mini', reasoning: 'high' })
+  expect(thinkingLevel).toBe('off')
+  expect(() => reasoningLevel('invalid')).toThrow()
+  const totals = usageCounters()
+  recordUsage(totals, { ...model, cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 } }, {
+    input: 1, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 10,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  })
+  expect(totals.costUsd).toBeCloseTo(30 / 1e6, 10)
+  expect(totals).toMatchObject({ inputTokens: 8, outputTokens: 2, cacheReadTokens: 3, cacheWriteTokens: 4, totalTokens: 10 })
+})

@@ -1,3 +1,4 @@
+import { defaultRegistry } from '../extensions/default.js'
 import { TenantScope } from '../db/tenant.js'
 import { traceparent } from '../http/trace.js'
 import { changeCommitted, notify } from '../http/events.js'
@@ -14,10 +15,7 @@ export class DemoPermissions implements PermissionsAdapter {
   constructor(private db: Store) {}
   async read(key: string, role = viewer) {
     if (this.fault === 'unknown_external_state') return null
-    return (
-      (await this.db.rows('demo_grants', { resource_key: key, role })).length >
-      0
-    )
+    return (await this.db.rows('demo_grants', { resource_key: key, role })).length > 0
   }
   async revoke(key: string, role = viewer) {
     this.revokes++
@@ -35,6 +33,7 @@ export class Executor {
     readonly adapter: PermissionsAdapter = new DemoPermissions(db),
     private leaseMs = 30000,
     private record?: (tenant: string, action: 'succeeded' | 'revoked' | 'manual_review') => void,
+    private registry = defaultRegistry,
   ) {}
   async run() {
     const jobs = await this.db.query<Job>(
@@ -57,21 +56,16 @@ export class Executor {
         [now(), seen.id, seen.version, seen.tenant_id, seen.resource_key],
       )
       if (!eligible) return
+      const [change] = await scope.rows('changes', { id: eligible.change_id })
+      const policy = this.registry.findAction(change)
+      if (!policy) return
       const [j] = await tx.query<Job>(
         `UPDATE jobs SET status='running', version=version+1,
         attempt_count=attempt_count+1, lease_owner=$2, lease_until=$3, updated_at=now()
         WHERE id=$1 RETURNING *`,
-        [
-          seen.id,
-          this.owner,
-          new Date(Date.now() + this.leaseMs).toISOString(),
-        ],
+        [seen.id, this.owner, new Date(Date.now() + this.leaseMs).toISOString()],
       )
-      await scope.update(
-        'changes',
-        { id: j.change_id },
-        { status: 'executing', updated_at: now() },
-      )
+      await scope.update('changes', { id: j.change_id }, { status: 'executing', updated_at: now() })
       await scope.addChild('change_audit', {
         id: crypto.randomUUID(),
         change_id: j.change_id,
@@ -80,7 +74,6 @@ export class Executor {
         note: j.kind,
         created_at: j.updated_at,
       })
-      const [change] = await scope.rows('changes', { id: j.change_id })
       const overlap =
         j.kind === 'revoke' &&
         (
@@ -88,19 +81,13 @@ export class Executor {
             `SELECT 1 FROM changes
         WHERE id<>$1 AND tenant_id=$2 AND app=$3 AND role=$4 AND beneficiary_principal=$5
         AND status='succeeded' AND (expires_at IS NULL OR expires_at>now()) LIMIT 1`,
-            [
-              change.id,
-              change.tenant_id,
-              change.app,
-              change.role,
-              change.beneficiary_principal,
-            ],
+            [change.id, change.tenant_id, change.app, change.role, change.beneficiary_principal],
           )
         ).length > 0
-      return { j, change, overlap }
+      return { j, change, overlap, policy }
     })
     if (!claimed) return
-    const { j, change, overlap } = claimed
+    const { j, change, overlap, policy } = claimed
     notify(this.db, change.tenant_id, 'change', change.id)
     const trace = traceparent(j.traceparent)
     const granting = j.kind === 'grant'
@@ -108,7 +95,7 @@ export class Executor {
     let expiredBeforeWrite = false
     if (!overlap) {
       try {
-        confirmed = await this.adapter.read(j.resource_key, change.role, trace)
+        confirmed = await policy.read(this.adapter, j.resource_key, change, trace)
         expiredBeforeWrite =
           granting &&
           confirmed === false &&
@@ -117,16 +104,13 @@ export class Executor {
         if (!expiredBeforeWrite && confirmed === !granting) {
           if (Date.parse(j.lease_until!) <= Date.now()) return
           try {
-            await this.adapter[j.kind](j.resource_key, change.role, trace)
+            await policy[granting ? 'apply' : 'revoke'](this.adapter, j.resource_key, change, trace)
           } catch {
             // A timeout can follow a committed external write. Verify before deciding.
           }
-          if (
-            this.adapter instanceof DemoPermissions &&
-            this.adapter.fault === 'crash_after_external_write'
-          )
+          if (this.adapter instanceof DemoPermissions && this.adapter.fault === 'crash_after_external_write')
             return
-          confirmed = await this.adapter.read(j.resource_key, change.role, trace)
+          confirmed = await policy.read(this.adapter, j.resource_key, change, trace)
         }
       } catch {
         confirmed = null
@@ -160,7 +144,7 @@ export class Executor {
       if (!updated.length) return false
       const action = status === 'succeeded' && !granting ? 'revoked' : status
       if (granting && status === 'succeeded' && change.expires_at)
-        await enqueue(scope, change, 'revoke', trace)
+        await enqueue(scope, change, 'revoke', trace, j.resource_key)
       await scope.addChild('change_audit', {
         id: crypto.randomUUID(),
         change_id: change.id,
@@ -178,10 +162,15 @@ export class Executor {
           updated_at: now(),
         },
       )
+      if (change.ticket_id && (action === 'succeeded' || action === 'revoked'))
+        for (const topic of policy.bumpTopics) await scope.bumpWatermark(change.ticket_id, topic)
       return true
     })
     if (committed) {
-      if (status !== 'failed') this.record?.(change.tenant_id, status === 'succeeded' && !granting ? 'revoked' : status)
+      if (status === 'failed' || (status === 'succeeded' && (!granting || !change.expires_at)))
+        this.registry.finish(change.id)
+      if (status !== 'failed')
+        this.record?.(change.tenant_id, status === 'succeeded' && !granting ? 'revoked' : status)
       await changeCommitted(this.db, change.tenant_id, change.id)
     }
   }

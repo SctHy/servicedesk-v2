@@ -675,6 +675,9 @@ nav code { color: var(--muted-foreground); }
   font-size: 12.5px;
   gap: 5px;
 }
+.work dl { margin: 4px 0 8px; font-size: 12px; }
+.work dl > div { display: grid; grid-template-columns: minmax(6em, 30%) 1fr; gap: 8px; }
+.work dt, .work dd { margin: 0; overflow-wrap: anywhere; }
 .work .fold > svg:first-child { width: 13px; }
 .tool-info { display: flex; align-items: center; gap: 5px; min-width: 0; overflow: hidden; }
 .tool-info code { flex: 1 1 auto; min-width: 5ch; }

@@ -1,3 +1,5 @@
+import { defaultRegistry } from '../extensions/default.js'
+import { Interventions } from '../harness/runtime.js'
 import { TenantScope } from '../db/tenant.js'
 import { Metrics } from './metrics.js'
 import { traceparent } from './trace.js'
@@ -14,9 +16,6 @@ import { PgStore } from '../db/store.js'
 import type { Auth, Store, Run, Ticket, Event } from '../db/store.js'
 import { seed } from '../retrieval/lexical.js'
 import { Type } from 'typebox'
-import type { InvestigationSource } from '../adapters/source.js'
-import { fixture } from '../adapters/demo.js'
-import { appName, viewer } from '../changes/service.js'
 import type { Change } from '../changes/types.js'
 import { investigate, staleEvidence } from '../investigation/engine.js'
 
@@ -41,6 +40,7 @@ export async function application(
   transport?: StreamFn,
   authenticate: (id: unknown) => Auth | undefined = demoAuth,
   permissions: PermissionsAdapter = new DemoPermissions(db),
+  registry = defaultRegistry,
 ) {
   const app = Fastify({
     logger: {
@@ -90,6 +90,7 @@ export async function application(
   for (const { id } of await db.tx(tx => expireRuns(tx))) bus.emit('run:' + id)
   const shutdown = new AbortController()
   app.addHook('preClose', async () => shutdown.abort())
+  const interventions = new Map<string, Interventions>()
   const queues = new Map<string, Promise<void>>()
   const scope = (a: Auth) => ({ tenant_id: a.tenant_id, actor_id: a.actor_id })
   const fail = (statusCode: number, message: string) => Object.assign(Error(message), { statusCode })
@@ -111,7 +112,7 @@ export async function application(
   }
   const executor = new Executor(db, permissions, undefined, (tenant, action) => {
     metrics.for(tenant)[`jobs_${action}`]++
-  })
+  },registry)
   let active: Promise<void> | undefined
   let pending = false
   let timer: NodeJS.Timeout | undefined
@@ -199,7 +200,9 @@ export async function application(
     async (req) => {
       const t = await ticket(req.params.id, owner(req))
       local()
-      if (t.scenario !== 'B') throw fail(400, 'Scenario B required')
+      const supportsSession = registry.status(t.tenant_id).some(e =>
+        e.enabled && e.scenarios.some(s => s.id === t.scenario) && e.uiManifest.demoControls?.[t.scenario]?.includes('session'))
+      if (!supportsSession) throw fail(400, 'Session control unavailable')
       await new TenantScope(db, t.tenant_id).setSession(t.id, req.body.session)
       notify(db, t.tenant_id, 'ticket', t.id)
       return req.body
@@ -242,7 +245,7 @@ export async function application(
     },
     async (req, reply) => {
       const a = owner(req)
-      return reply.code(201).send(await draft(db, a, req.body))
+      return reply.code(201).send(await draft(db, a, req.body, undefined,registry))
     },
   )
   for (const path of ['decision', 'resolve']) {
@@ -262,7 +265,7 @@ export async function application(
         if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(req.params.id))
           throw fail(404, 'Unknown change')
         const auth = owner(req)
-        const result = await decide(db, auth, req.params.id, req.body, path === 'resolve', req.id)
+        const result = await decide(db, auth, req.params.id, req.body, path === 'resolve', req.id,registry)
         if (path === 'resolve' && (result.status === 'succeeded' || result.status === 'revoked'))
           metrics.for(auth.tenant_id)[`jobs_${result.status}`]++
         return result
@@ -270,22 +273,34 @@ export async function application(
     )
   }
   app.get('/healthz', async () => ({ ok: true }))
-  app.get('/api/demo/scenarios', async () => [
-    { id: 'A', title: '桌面端 403，网页正常' },
-    { id: 'B', title: '项目 B 只读访问被拒，请勿授予管理员权限' },
-  ])
+  app.get('/api/extensions',async req => registry.status(owner(req).tenant_id).filter(e=>!e.draining).map(({scenarios, ...ext}) => ({
+    ...ext, scenarios: scenarios.filter(s => s.adapter).map(({id,title}) => ({id,title})),
+  })))
+  app.post<{Params:{id:string};Body:{enabled:boolean}}>('/api/extensions/:id/toggle',{
+    schema:{params:idParams,body:Type.Object({enabled:Type.Boolean()},{additionalProperties:false})},
+  },async req => {
+    const auth = owner(req)
+    if (!privileged(auth)) throw fail(403,'Approval permission required')
+    registry.setTenantEnabled(auth.tenant_id,req.params.id,req.body.enabled)
+    bus.emit('tenant:'+auth.tenant_id,{type:'extensions',id:req.params.id})
+    return {enabled:req.body.enabled}
+  })
+  app.get('/api/demo/scenarios',async req => {
+    const tenant = req.headers.authorization || req.headers['x-demo-user'] ? owner(req).tenant_id : 'demo'
+    return registry.status(tenant).filter(e=>e.enabled).flatMap(e=>e.scenarios.map(({id,title})=>({id,title})))
+  })
   app.post<{ Body: { scenario: Ticket['scenario'] } }>(
     '/api/tickets',
     {
       schema: {
         body: body({
-          scenario: Type.Union([Type.Literal('A'), Type.Literal('B')]),
+          scenario: Type.String({ minLength: 1 }),
         }),
       },
     },
     async (req, reply) => {
       const a = owner(req)
-      if (!['A', 'B'].includes(req.body?.scenario)) throw fail(400, 'Invalid scenario')
+      if (!registry.status(a.tenant_id).some(e=>e.enabled && e.scenarios.some(s=>s.id === req.body.scenario && s.adapter))) throw fail(400, 'Invalid scenario')
       const t = {
         id: crypto.randomUUID(),
         ...scope(a),
@@ -304,7 +319,10 @@ export async function application(
     const t = await ticket(req.params.id, owner(req))
     const tenant = new TenantScope(db, t.tenant_id)
     const changes = await tenant.rows('changes', { ticket_id: t.id })
-    const watermark = await tenant.permissionWatermark(t.id)
+    const watermark = await tenant.watermarks(t.id)
+    const snapshot = registry.acquireSnapshot(t.tenant_id)
+    const topics = new Map(snapshot.observations.map(o=>[o.name,o.invalidatedBy]))
+    snapshot.release()
     return {
       ...t,
       changes,
@@ -312,16 +330,32 @@ export async function application(
       demo: permissions instanceof DemoPermissions,
       evidence: (await tenant.children('evidence', t.id)).map((e) => ({
         ...e,
-        stale: staleEvidence(e, watermark, t.session_updated_at),
+        stale: staleEvidence(e, watermark,topics.get(e.source) ?? []),
       })),
-      runs: (await tenant.rows('runs', { ticket_id: t.id })).sort((a, b) =>
-        a.created_at.localeCompare(b.created_at),
+      runs: await db.query(
+        `SELECT r.*, EXISTS (SELECT 1 FROM run_checkpoints c WHERE c.run_id=r.id AND c.tenant_id=r.tenant_id) AS has_checkpoint
+         FROM runs r WHERE r.tenant_id=$1 AND r.ticket_id=$2 ORDER BY r.created_at, r.id`,
+        [t.tenant_id, t.id],
       ),
     }
   })
+  app.post<{ Params: { runId: string }; Body: { message: string; mode?: 'steer' | 'followUp' } }>(
+    '/api/runs/:runId/steer', { schema: {
+      params: Type.Object({ runId: Type.String({ format: 'uuid' }) }),
+      body: body({ message: Type.String({ minLength: 1 }), mode: Type.Optional(Type.Union([Type.Literal('steer'), Type.Literal('followUp')])) }),
+    } }, async (req, reply) => {
+      const a = owner(req)
+      const [run] = await new TenantScope(db, a.tenant_id).rows('runs', { actor_id: a.actor_id, id: req.params.runId })
+      if (!run) throw fail(404, 'Unknown run')
+      await ticket(run.ticket_id, a)
+      const inbox = interventions.get(run.id)
+      if (!inbox || run.status !== 'running') throw fail(409, 'Run unavailable for intervention')
+      inbox.push(req.body.mode ?? 'steer', req.body.message)
+      return reply.code(202).send({ runId: run.id })
+    })
   app.post<{
     Params: { id: string }
-    Body: { message: string; client_request_id: string }
+    Body: { message: string; client_request_id: string; resume_from?: string }
   }>(
     '/api/tickets/:id/runs',
     {
@@ -330,6 +364,7 @@ export async function application(
         body: body({
           message: Type.String(),
           client_request_id: Type.String(),
+          resume_from: Type.Optional(Type.String({ format: 'uuid' })),
         }),
       },
     },
@@ -351,17 +386,23 @@ export async function application(
         const tenant = await TenantScope.inTransaction(tx, a.tenant_id)
         const [existing] = await tenant.rows('runs', filter)
         if (existing) {
-          if (existing.request_fingerprint !== fingerprint) throw fail(409, 'Request content changed')
+          if (existing.request_fingerprint !== fingerprint || (existing.resume_from ?? undefined) !== req.body.resume_from) throw fail(409, 'Request content changed')
           return { run: existing, created: false, expired: [] }
         }
         const expired = await expireRuns(tx, t.id)
         if ((await tx.query("SELECT 1 FROM runs WHERE ticket_id=$1 AND status='running'", [t.id])).length)
           return { run: undefined, created: false, expired }
+        if (req.body.resume_from) {
+          const [source] = await tx.query(`SELECT 1 FROM runs r JOIN run_checkpoints c ON c.run_id=r.id
+            WHERE r.id=$1 AND r.ticket_id=$2 AND r.tenant_id=$3 AND r.actor_id=$4 AND r.status='failed'
+            AND r.request_fingerprint=$5`, [req.body.resume_from, t.id, a.tenant_id, a.actor_id, fingerprint])
+          if (!source) throw fail(409, 'Checkpoint unavailable')
+        }
         const [run] = await tx.query<Run>(
           `INSERT INTO runs (id, tenant_id, actor_id, ticket_id, client_request_id, request_fingerprint,
-             created_at, status, lease_until)
-           VALUES ($1,$2,$3,$4,$5,$6,now(),'running',now()+$7 * interval '1 millisecond') RETURNING *`,
-          [crypto.randomUUID(), a.tenant_id, a.actor_id, t.id, client_request_id, fingerprint, timeoutMs + 5000],
+             created_at, status, lease_until, resume_from)
+           VALUES ($1,$2,$3,$4,$5,$6,now(),'running',now()+$7 * interval '1 millisecond',$8) RETURNING *`,
+          [crypto.randomUUID(), a.tenant_id, a.actor_id, t.id, client_request_id, fingerprint, timeoutMs + 5000, req.body.resume_from ?? null],
         )
         return { run, created: true, expired }
       })
@@ -389,29 +430,15 @@ export async function application(
           bus.emit('run:' + run.id)
           if (terminal) notify(db, t.tenant_id, 'ticket', t.id)
         }
+        const inbox = new Interventions()
+        interventions.set(run.id, inbox)
+        const snapshot = registry.acquireSnapshot(a.tenant_id)
         const task = (async () => {
           try {
             await emit({ type: 'started' })
-            const source: InvestigationSource = fixture(t.scenario)
-            if (t.scenario === 'B' && permissions instanceof DemoPermissions) {
-              const current = await ticket(t.id, a)
-              source.sessionUpdatedAt = current.session_updated_at ?? undefined
-              source.get_login_sessions = async (email) => {
-                const wrong = (await ticket(t.id, a)).session === 'wrong_account'
-                const granted = await permissions.read(
-                  JSON.stringify([a.tenant_id, appName, 'bob']),
-                  viewer,
-                )
-                return fixture('B', {
-                  webStatus: granted ? 200 : 403,
-                  desktopStatus: !wrong && granted ? 200 : 403,
-                  ...(wrong && {
-                    principal: 'external-71',
-                    sessionEmail: 'other@personal.example',
-                  }),
-                }).get_login_sessions(email)
-              }
-            }
+            const scenario = snapshot.extensions.flatMap(e=>e.scenarios).find(s=>s.id === t.scenario)
+            if (!scenario?.adapter) throw Error('Scenario unavailable')
+            const source = await scenario.adapter({auth:a,permissions,demo:permissions instanceof DemoPermissions,ticket:()=>ticket(t.id,a)})
             const usage = await investigate(
               db,
               a,
@@ -423,9 +450,9 @@ export async function application(
               source,
               undefined,
               true,
-              { signal: shutdown.signal, timeoutMs },
+              { signal: shutdown.signal, timeoutMs, runId: run.id, resumeFrom: req.body.resume_from, interventions: inbox },
               permissions,
-              req.id,
+              req.id,registry,snapshot,
             )
             metrics.usage(a.tenant_id, usage)
           } catch (err) {
@@ -444,6 +471,8 @@ export async function application(
         queues.set(t.id, task)
         void task
           .finally(() => {
+            snapshot.release()
+            interventions.delete(run.id)
             if (queues.get(t.id) === task) queues.delete(t.id)
           })
           .catch(() => {})
@@ -518,10 +547,12 @@ export async function application(
       'Cache-Control': 'no-cache',
     })
     const send = (event: unknown) => reply.raw.write('data: ' + JSON.stringify(event) + '\n\n')
+    const unsubscribe = registry.onManifestChange(id => send({ type: 'extensions', id }))
     bus.on(channel, send)
     reply.raw.write(': connected\n\n')
     const heartbeat = setInterval(() => reply.raw.write(': heartbeat\n\n'), 15000)
     const end = () => {
+      unsubscribe()
       bus.off(channel, send)
       clearInterval(heartbeat)
       shutdown.signal.removeEventListener('abort', end)

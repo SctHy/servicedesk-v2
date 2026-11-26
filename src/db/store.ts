@@ -14,7 +14,7 @@ export type Ticket = Pick<Auth, 'tenant_id' | 'actor_id'> & {
   id: string
   session?: 'normal' | 'wrong_account'
   session_updated_at?: string | null
-  scenario: 'A' | 'B'
+  scenario: string
 }
 export type Run = Pick<Ticket, 'tenant_id' | 'actor_id'> & {
   id: string
@@ -22,6 +22,7 @@ export type Run = Pick<Ticket, 'tenant_id' | 'actor_id'> & {
   client_request_id: string
   status: 'running' | 'completed' | 'failed'
   lease_until: string | null
+  resume_from?: string | null
   request_fingerprint: string
   created_at: string
 }
@@ -35,7 +36,12 @@ export type Evidence = {
 export type Event = {
   run_id: string
   seq: number
-  data: { type: string; [key: string]: unknown }
+  data: { [key: string]: unknown } & (
+    | { type: 'started' | 'question' | 'model' | 'evidence' | 'draft' | 'final' | 'error' }
+    | { type: 'tool_progress'; source: string; status: 'running' | 'done' | 'failed' }
+    | { type: 'reply_progress'; status: 'thinking' | 'writing' }
+    | { type: 'reply_preview'; text: string }
+  )
 }
 export type Chunk = {
   id: string
@@ -175,6 +181,11 @@ export class Store {
         '005_observability',
         '006_tenant_relations',
         '007_multi_instance_runs',
+        '008_watermarks',
+        '009_run_checkpoints',
+        '010_run_resume_source',
+        '011_extension_version',
+        '012_extension_scenarios',
       ]
       for (const [i, file] of files.entries()) {
         if (

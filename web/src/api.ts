@@ -51,3 +51,83 @@ export async function tenantEvents(
     await new Promise((resolve) => setTimeout(resolve, 1000))
   }
 }
+
+export type ObservationMeta = { title: string; summaryFields?: string[] }
+export type ActionMeta = {
+  id: string
+  app: string
+  role: string
+  title: string
+  standalone: boolean
+}
+export type Extension = {
+  id: string
+  version: string
+  title: string
+  enabled: boolean
+  activeRefs: number
+  scenarios: { id: string; title: string }[]
+  uiManifest: {
+    observationMeta: Record<string, ObservationMeta>
+    actions: ActionMeta[]
+    demoControls?: Record<string, string[]>
+  }
+}
+type Api = ReturnType<typeof client>
+export type Metrics = {
+  cache_read_tokens: number
+  cache_write_tokens: number
+  cost_usd: number
+  runs_total: number
+  runs_failed: number
+  tokens_total: number
+  tool_attempts: number
+  tool_failures: number
+  jobs_succeeded: number
+  jobs_revoked: number
+  jobs_manual_review: number
+}
+export async function extensions(
+  api: Api,
+  signal?: AbortSignal,
+): Promise<Extension[]> {
+  return (await api('extensions', undefined, signal)).json()
+}
+export async function metrics(
+  api: Api,
+  signal?: AbortSignal,
+): Promise<Metrics> {
+  return (await api('metrics', undefined, signal)).json()
+}
+export async function toggle(
+  api: Api,
+  id: string,
+  enabled: boolean,
+): Promise<{ enabled: boolean }> {
+  return (
+    await api('extensions/' + encodeURIComponent(id) + '/toggle', { enabled })
+  ).json()
+}
+export async function startRun(
+  api: Api,
+  ticket: string,
+  message: string,
+  signal: AbortSignal,
+  resume_from?: string,
+): Promise<{ runId: string }> {
+  return (
+    await api(
+      'tickets/' + ticket + '/runs',
+      { message, client_request_id: crypto.randomUUID(), resume_from },
+      signal,
+    )
+  ).json()
+}
+export async function steer(
+  api: Api,
+  run: string,
+  message: string,
+  signal?: AbortSignal,
+): Promise<{ runId: string }> {
+  return (await api('runs/' + run + '/steer', { message }, signal)).json()
+}

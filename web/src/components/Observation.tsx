@@ -10,7 +10,11 @@ import {
 } from 'lucide-react'
 import { Badge, Collapsible, CopyButton } from './ui'
 
+import type { ObservationMeta } from '../api'
+
 export type Entry = {
+  detail?: string
+  status?: string
   type: string
   evidenceId?: string
   observedAt?: string
@@ -22,19 +26,28 @@ export type Entry = {
 export function Observation({
   e,
   historical,
+  observationMeta,
 }: {
   e: Entry
+  observationMeta?: Record<string, ObservationMeta>
   historical: boolean
 }) {
   if (e.evidenceId) {
-    const Icon =
-      {
-        get_login_sessions: Monitor,
-        get_directory_profile: UserCheck,
-        get_app_permissions: ShieldCheck,
-        get_service_events: Activity,
-        search_runbooks: BookOpen,
-      }[e.source ?? ''] ?? Search
+    const meta = observationMeta?.[e.source ?? '']
+    const data = e.data && typeof e.data === 'object' ? e.data : { value: e.data } as Record<string, unknown>
+    const fields = Array.isArray(meta?.summaryFields)
+      ? meta.summaryFields
+      : Object.keys(data).slice(0, 4)
+    const icons = {
+      get_login_sessions: Monitor,
+      get_directory_profile: UserCheck,
+      get_app_permissions: ShieldCheck,
+      get_service_events: Activity,
+      search_runbooks: BookOpen,
+    }
+    const Icon = Object.hasOwn(icons, e.source ?? '')
+      ? icons[e.source as keyof typeof icons]
+      : Search
     return (
       <article className="entry work" data-timeline-row-kind="work">
         <Collapsible
@@ -43,12 +56,14 @@ export function Observation({
             <>
               <Icon size={14} />
               <span className="tool-info" title={e.source}>
-                <code>{e.source}</code>
+                <code>
+                  {typeof meta?.title === 'string' ? meta.title : e.source}
+                </code>
                 <Badge tone={historical ? 'neutral' : 'sky'}>
                   {historical ? '历史' : '最新'}
                 </Badge>
                 {['samePrincipal', 'sameMailbox']
-                  .filter((k) => k in (e.data ?? {}))
+                  .filter((k) => Object.hasOwn(data, k))
                   .map((k) => (
                     <Badge
                       key={k}
@@ -68,6 +83,21 @@ export function Observation({
             {JSON.stringify(e.data, null, 2)}
           </pre>
         </Collapsible>
+        <dl>
+          {fields
+            .filter((k) => Object.hasOwn(data, k))
+            .map((k) => (
+              <div key={k}>
+                <dt>{k}</dt>
+                <dd>
+                  {(typeof data[k] === 'string'
+                    ? data[k]
+                    : JSON.stringify(data[k])
+                  )?.slice(0, 160)}
+                </dd>
+              </div>
+            ))}
+        </dl>
       </article>
     )
   }

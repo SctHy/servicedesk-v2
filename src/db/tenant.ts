@@ -43,17 +43,23 @@ export class TenantScope {
     )
     if (!inserted.length) throw Error('Parent unavailable')
   }
-  async permissionWatermark(ticket: string) {
-    const [row] = await this.db.query<{ updated_at: string | null }>(
-      `WITH scoped AS (SELECT * FROM changes WHERE tenant_id=$1 AND ticket_id=$2)
-       SELECT max(stamp) AS updated_at FROM (
-         SELECT updated_at AS stamp FROM scoped WHERE status IN ('succeeded','revoked')
-         UNION ALL SELECT a.created_at FROM scoped c JOIN change_audit a ON a.change_id=c.id
-         WHERE a.action IN ('succeeded','revoked')
-       ) transitions`,
+  async bumpWatermark(ticket: string, topic: string, at = new Date().toISOString()) {
+    await this.db.query(
+      `INSERT INTO resource_watermarks (tenant_id,ticket_id,topic,updated_at) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (tenant_id,ticket_id,topic) DO UPDATE SET updated_at=excluded.updated_at
+       WHERE resource_watermarks.updated_at < excluded.updated_at`,
+      [this.tenant, ticket, topic, at],
+    )
+  }
+  async watermarks(ticket: string): Promise<Record<string, string>> {
+    const rows = await this.db.query<{topic: string; updated_at: string}>(
+      'SELECT topic,updated_at FROM resource_watermarks WHERE tenant_id=$1 AND ticket_id=$2',
       [this.tenant, ticket],
     )
-    return row.updated_at
+    return Object.fromEntries(rows.map(row => [row.topic, row.updated_at]))
+  }
+  async permissionWatermark(ticket: string) {
+    return (await this.watermarks(ticket)).access_state ?? null
   }
   visibleChanges(actor: string, privileged: boolean) {
     return this.db.query<Tables['changes']>(
@@ -63,18 +69,21 @@ export class TenantScope {
     )
   }
   setSession(ticket: string, session: string) {
-    return this.db.query(
-      `UPDATE tickets SET session=$3, session_updated_at=greatest($4::timestamptz,
-        (SELECT max(observed_at) + interval '1 millisecond' FROM evidence
-         WHERE ticket_id=$1 AND source='get_login_sessions'))
-      WHERE id=$1 AND tenant_id=$2 AND session<>$3`,
-      [ticket, this.tenant, session, new Date().toISOString()],
-    )
+    return this.db.tx(async db => {
+      const [row] = await db.query<{session_updated_at: string}>(
+        `UPDATE tickets SET session=$3, session_updated_at=greatest($4::timestamptz,
+          (SELECT max(observed_at) + interval '1 millisecond' FROM evidence
+           WHERE ticket_id=$1 AND source='get_login_sessions'))
+         WHERE id=$1 AND tenant_id=$2 AND session<>$3 RETURNING session_updated_at`,
+        [ticket, this.tenant, session, new Date().toISOString()],
+      )
+      if (row) await new TenantScope(db, this.tenant).bumpWatermark(ticket, 'session_state', row.session_updated_at)
+    })
   }
   history(ticket: string) {
-    return this.db.query<{ question: string; answer: string }>(
+    return this.db.query<{ question: string; answer: string; created_at: string }>(
       `
-      SELECT q.data->>'text' AS question, a.data->>'text' AS answer FROM runs r
+      SELECT r.created_at, q.data->>'text' AS question, a.data->>'text' AS answer FROM runs r
       JOIN run_events q ON q.run_id=r.id AND q.data->>'type'='question'
       JOIN run_events a ON a.run_id=r.id AND a.data->>'type'='final'
       WHERE r.ticket_id=$1 AND r.tenant_id=$2 ORDER BY r.created_at`,

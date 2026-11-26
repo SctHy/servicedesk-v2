@@ -1,4 +1,6 @@
 export type Change = {
+  extension_id?: string | null
+  extension_version?: string | null
   id: string
   tenant_id: string
   ticket_id: string | null

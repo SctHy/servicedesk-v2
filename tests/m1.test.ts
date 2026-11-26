@@ -56,6 +56,17 @@ it('applies field policy, scoped authenticated encryption, and contextual secret
   ).toBe(
     '[NAME_1] [EMP_1] [PHONE_1] [EMAIL_2] [REDACTED] ' + hash + ' v2.1.4 403',
   )
+  const emails = ['first@corp.example', 'second@corp.example', 'first@corp.example']
+  const refs = await Promise.all(emails.map(email => v.bind('EMAIL', email)))
+  expect(refs[0]).toBe(refs[2])
+  expect(refs[0]).not.toBe(refs[1])
+  await v.bind('NAME', 'Agent mail')
+  expect(await v.preview('Agent mail@outside.example。')).not.toContain('outside')
+  const sensitive = '联系 Alice、EMP-101、13800138000 或 private@corp.example。token="split。key"'
+  for (let end = 1; end <= sensitive.length; end++) {
+    const preview = await v.preview('已核实。' + sensitive.slice(0, end))
+    expect(preview).not.toMatch(/Alic|EMP-10|13800|private|corp\.example|split|key/)
+  }
   const restored = await Vault.open(db, t, key)
   expect(restored.resolve(auth, t.id, '[EMAIL_1]', 'EMAIL')).toBe(
     'alice@corp.example',
@@ -264,7 +275,7 @@ it('sends a masked request over the OpenAI-compatible HTTP transport', async () 
       ],
     }
     const chunks = [
-      '请核实登录账号 split@',
+      '请核实登录账号。split@',
       'outside.example 13800',
       '138000 token=split',
       'Key9988',
@@ -317,7 +328,10 @@ it('sends a masked request over the OpenAI-compatible HTTP transport', async () 
       url: '/api/runs/' + run.json().runId + '/events',
       headers,
     })
-    expect(events.body).toContain('请核实登录账号')
+    expect(events.body).toContain('"reply_preview"')
+    expect(events.body).toContain('请核实登录账号。')
+    const seqs = [...events.body.matchAll(/^id: (\d+)/gm)].map(m => Number(m[1]))
+    expect(seqs).toEqual(seqs.map((_, i) => i + 1))
     const persisted = await db.rows('run_events', { run_id: run.json().runId })
     for (const safe of [events.body, JSON.stringify(persisted)]) {
       expect(safe).not.toMatch(
@@ -336,4 +350,40 @@ it('sends a masked request over the OpenAI-compatible HTTP transport', async () 
     await app.close()
     await endpoint.close()
   }
+})
+
+it('adds vault detectors and typed fields while enforcing baseline policy', async () => {
+  await using db = new MemoryStore()
+  const t = fresh()
+  await db.add('tickets', t)
+  const v = await Vault.open(db, t, key, {
+    extraDetectors: [{ detect: text => [...text.matchAll(/tenant-code/g)].map(m =>
+      ({ start: m.index, end: m.index + m[0].length, kind: 'SECRET' })) }],
+    extraFieldKinds: { alias: 'NAME', email: 'EMP', password: 'NAME' },
+  })
+  expect(await v.project({ alias: 'Ada', email: 'one@example.com', password: 'hidden' }))
+    .toEqual({ alias: '[NAME_1]', email: '[EMAIL_1]' })
+  expect(await v.text('tenant-code password=test two@example.com')).toBe('[REDACTED] [REDACTED] [EMAIL_2]')
+})
+
+it('advances tenant-scoped topic watermarks and only invalidates subscribed evidence', async () => {
+  const { TenantScope } = await import('../src/db/tenant')
+  const { staleEvidence } = await import('../src/investigation/engine')
+  await using db = new MemoryStore()
+  const t = fresh()
+  await db.add('tickets', t)
+  const scope = new TenantScope(db, t.tenant_id), other = new TenantScope(db, 'other')
+  const old = '2025-01-01T00:00:00.000Z', latest = '2025-01-02T00:00:00.000Z'
+  await scope.bumpWatermark(t.id, 'inventory', latest)
+  await scope.bumpWatermark(t.id, 'inventory', old)
+  expect(await scope.watermarks(t.id)).toEqual({ inventory: latest })
+  expect(await other.watermarks(t.id)).toEqual({})
+  await expect(other.bumpWatermark(t.id, 'inventory')).rejects.toThrow()
+  await scope.setSession(t.id, 'wrong_account')
+  const marks = await scope.watermarks(t.id)
+  expect(marks.session_state).toBe((await scope.rows('tickets', { id: t.id }))[0].session_updated_at!)
+  const e = { ticket_id: t.id, id: crypto.randomUUID(), observed_at: old, source: 'inventory_tool', data: {} }
+  expect(staleEvidence(e, marks, ['inventory'])).toBe(true)
+  expect(staleEvidence(e, marks)).toBe(false)
+  expect(staleEvidence({ ...e, source: 'get_login_sessions' }, marks)).toBe(true)
 })

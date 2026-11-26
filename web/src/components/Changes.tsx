@@ -3,6 +3,7 @@ import { Collapsible as Fold } from '@base-ui/react/collapsible'
 import { Plus, ShieldCheck } from 'lucide-react'
 import { toast } from 'sonner'
 import { Badge, Button, Collapsible, CopyButton, Panel, Select } from './ui'
+import type { Extension } from '../api'
 const tones: Record<string, string> = {
   pending_approval: 'amber',
   executing: 'sky',
@@ -14,6 +15,9 @@ const tones: Record<string, string> = {
 type ChangeView = {
   id: string
   status: string
+  app: string
+  extension_id?: string
+  extension_version?: string
   requester_id: string
   beneficiary_principal: string
   role: string
@@ -29,7 +33,9 @@ export function Changes({
   report,
   onCount,
   revision,
+  actionMeta,
 }: {
+  actionMeta: Extension[]
   revision: number
   onCount: (count: number) => void
   user: string
@@ -40,6 +46,13 @@ export function Changes({
     [reason, setReason] = useState(''),
     [ttl, setTtl] = useState(''),
     [notes, setNotes] = useState<Record<string, string>>({})
+  const [choice, setChoice] = useState('')
+  const actions = actionMeta
+    .filter((e) => e.enabled)
+    .flatMap((e) => e.uiManifest.actions.filter((a) => a.standalone))
+  const key = (a: { app: string; role: string }) =>
+    JSON.stringify([a.app, a.role])
+  const selected = actions.find((a) => key(a) === choice) ?? actions[0]
   const pending = rows.filter((c) => c.status === 'pending_approval').length
   useEffect(() => onCount(pending), [pending, onCount])
   async function refresh(signal?: AbortSignal) {
@@ -81,16 +94,30 @@ export function Changes({
             <form
               onSubmit={(e) => {
                 e.preventDefault()
+                if (!selected) return
                 void act('changes', {
-                  app: 'project-b-app',
-                  role: 'project-b:viewer',
+                  app: selected.app,
+                  role: selected.role,
                   reason,
                   ...(ttl && { ttl_minutes: Number(ttl) }),
                 })
               }}
             >
+              {selected ? (
+                <Select
+                  label="申请动作"
+                  value={key(selected)}
+                  onChange={setChoice}
+                  options={actions.map((a) => ({
+                    value: key(a),
+                    label: a.title + ' · ' + a.app + ' / ' + a.role,
+                  }))}
+                />
+              ) : (
+                <p>当前没有已启用且支持手动申请的动作。</p>
+              )}
               <label>
-                项目 B 只读权限申请理由
+                申请理由
                 <input
                   required
                   value={reason}
@@ -110,7 +137,7 @@ export function Changes({
                   ]}
                 />
               </label>
-              <Button type="submit" variant="primary">
+              <Button disabled={!selected} type="submit" variant="primary">
                 提交申请
               </Button>
             </form>
@@ -122,6 +149,19 @@ export function Changes({
         {rows.toReversed().map((c) => (
           <Panel key={c.id}>
             <strong>
+              {actionMeta
+                .find(
+                  (e) =>
+                    e.id === c.extension_id &&
+                    e.version === c.extension_version,
+                )
+                ?.uiManifest.actions.find((a) => key(a) === key(c))?.title ??
+                c.app}
+              {c.extension_id && (
+                <Badge>
+                  {c.extension_id}@{c.extension_version}
+                </Badge>
+              )}
               {c.beneficiary_principal} <code>{c.role}</code>
             </strong>
             <p>{c.reason}</p>
@@ -187,7 +227,11 @@ export function Changes({
                         c.id +
                         '/' +
                         (manual ? 'resolve' : 'decision'),
-                      { decision: d, note, payload_hash: c.payload_hash },
+                      {
+                        decision: d,
+                        note,
+                        payload_hash: c.payload_hash,
+                      },
                     )
                   }}
                 >

@@ -1,3 +1,4 @@
+import { TenantScope } from '../src/db/tenant'
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import pg from 'pg'
 import { randomBytes } from 'node:crypto'
@@ -230,11 +231,22 @@ for (const pgMode of [false, true]) {
         expect((await db.rows('changes', {id: c.id}))[0].status).toBe('revoked')
       })
       it('requires evidence to close an unknown revoke and records the recovery time', async () => {
-        const c = await draft(db, bob, { ...input, ttl_minutes: 0.01 })
+        const ticket = { id: crypto.randomUUID(), tenant_id: bob.tenant_id, actor_id: bob.actor_id, scenario: 'B' as const }
+        await db.add('tickets', ticket)
+        const evidence = [
+          { source: 'get_login_sessions', data: { samePrincipal: true } },
+          { source: 'get_app_permissions', data: { app: appName, roles: [] } },
+        ].map(e => ({ ...e, id: crypto.randomUUID(), ticket_id: ticket.id, observed_at: new Date().toISOString() }))
+        const c = await draft(db, bob, { ...input, ttl_minutes: 0.01 }, {
+          ticket, beneficiary: bob.actor_id, evidence,
+        })
+        const scope = new TenantScope(db, bob.tenant_id)
         await decide(db, carol, c.id, { decision: 'approve', payload_hash: c.payload_hash })
         const adapter = new DemoPermissions(db)
         const executor = new Executor(db, adapter)
         await executor.run()
+        const grantTime = await scope.permissionWatermark(ticket.id)
+        expect(grantTime).toBeTruthy()
         await Bun.sleep(Math.max(0, Date.parse(c.expires_at!) - Date.now() + 5))
         adapter.fault = 'unknown_external_state'
         await executor.run()
@@ -244,6 +256,7 @@ for (const pgMode of [false, true]) {
         adapter.fault = undefined
         await adapter.revoke(job.resource_key)
         await decide(db, carol, c.id, {decision:'succeeded',payload_hash:c.payload_hash,note:'核对外部角色已移除'},true)
+        expect(Date.parse((await scope.permissionWatermark(ticket.id))!)).toBeGreaterThan(Date.parse(grantTime!))
         expect((await db.rows('changes', {id:c.id}))[0].revoked_at).toBeTruthy()
       })
       it('isolates audit and exercises account drift through the HTTP controls', async () => {
@@ -779,7 +792,12 @@ it('authenticates signed callers and carries approval traces into metered execut
   await using db = new MemoryStore()
   const http = permissionServer()
   const key = randomBytes(32)
-  const app = await application(db, key, undefined, undefined, http.adapter)
+  let calls = 0
+  const transport = mockStream(() => { calls++ }, {
+    input: 1, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 10,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.25 },
+  })
+  const app = await application(db, key, transport, undefined, http.adapter)
   const { signToken } = await import('../src/http/auth')
   const token = signToken(bob, key, 60)
   const headers = { authorization: 'Bearer ' + token }
@@ -816,13 +834,19 @@ it('authenticates signed callers and carries approval traces into metered execut
     expect(approved.statusCode).toBe(200)
     expect(approved.headers.traceparent).toBe(trace)
     for (let i = 0; i < 100 && !(await metrics()).json().jobs_succeeded; i++) await Bun.sleep(10)
+    expect(calls).toBeGreaterThan(1)
+    const scope = new TenantScope(db, bob.tenant_id)
+    expect((await scope.watermarks(ticket.id)).access_state).toBeTruthy()
     expect(http.traces.slice(-3)).toEqual([trace, trace, trace])
     expect((await metrics()).json()).toEqual({
       runs_total: 1,
       runs_failed: 0,
       tool_attempts: 6,
       tool_failures: 0,
-      tokens_total: 0,
+      tokens_total: calls * 10,
+      cache_read_tokens: calls * 3,
+      cache_write_tokens: calls * 4,
+      cost_usd: calls * 0.25,
       jobs_succeeded: 1,
       jobs_revoked: 0,
       jobs_manual_review: 0,

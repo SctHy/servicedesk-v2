@@ -2,13 +2,22 @@ import { useResizableWidth } from './hooks/useResizableWidth'
 import { ScrollArea } from '@base-ui/react/scroll-area'
 import { Observation, type Entry } from './components/Observation'
 import { useState, useEffect, useRef } from 'react'
-import { client, tenantEvents } from './api'
+import {
+  client,
+  tenantEvents,
+  extensions,
+  toggle,
+  startRun,
+  steer,
+  metrics,
+  type Metrics,
+  type Extension,
+} from './api'
 import { Changes } from './components/Changes'
 import {
   ArrowUp,
   FolderKey,
   LoaderCircle,
-  Monitor,
   Moon,
   PanelLeftClose,
   PanelLeftOpen,
@@ -39,20 +48,37 @@ function Desk({
 }) {
   const [tickets, setTickets] = useState<Ticket[]>([]),
     [id, setId] = useState(''),
-    [scenario, setScenario] = useState('A')
+    [choice, setScenario] = useState('')
   const [message, setMessage] = useState(''),
     [entries, setEntries] = useState<Entry[]>([]),
     [busy, setBusy] = useState(false),
     [investigating, setInvestigating] = useState(false),
     [error, setError] = useState('')
-  const [cases, setCases] = useState<{ id: string; title: string }[]>([])
+  const [plugins, setPlugins] = useState<Extension[]>([])
+  const [usage, setUsage] = useState<Metrics>()
+  const [runId, setRunId] = useState('')
+  const [failed, setFailed] = useState('')
+  const questions = useRef(new Map<string, string>())
+  const cases = plugins.filter((p) => p.enabled).flatMap((p) => p.scenarios)
+  const scenario = cases.find((c) => c.id === choice)?.id ?? cases[0]?.id ?? ''
+  const observationMeta = Object.assign(
+    Object.create(null),
+    ...plugins.map((p) => p.uiManifest.observationMeta),
+  )
   const current = useRef<AbortController | null>(null)
   const api = client(user)
-  const [revision, setRevision] = useState({ change: 0, fault: 0, ticket: 0 })
+  const [revision, setRevision] = useState({
+    change: 0,
+    fault: 0,
+    ticket: 0,
+    extensions: 0,
+  })
   useEffect(() => {
     const ctl = new AbortController()
     void tenantEvents(user, ctl.signal, (type) =>
       setRevision((r) => ({
+        extensions:
+          r.extensions + Number(type === 'all' || type === 'extensions'),
         change: r.change + Number(type === 'all' || type === 'change'),
         fault: r.fault + Number(type === 'all' || type === 'fault'),
         ticket: r.ticket + Number(type === 'all' || type === 'ticket'),
@@ -66,16 +92,15 @@ function Desk({
   }
   useEffect(() => {
     const ctl = new AbortController()
-    Promise.all([
-      api('demo/scenarios', undefined, ctl.signal)
-        .then((r) => r.json())
-        .then(setCases),
-    ]).catch(report)
-    return () => {
-      ctl.abort()
-      current.current?.abort()
-    }
-  }, [])
+    extensions(api, ctl.signal).then(setPlugins).catch(report)
+    return () => ctl.abort()
+  }, [revision.extensions, revision.ticket, revision.change, runId])
+  useEffect(() => () => current.current?.abort(), [])
+  useEffect(() => {
+    const ctl = new AbortController()
+    metrics(api, ctl.signal).then(setUsage).catch(report)
+    return () => ctl.abort()
+  }, [revision.ticket, busy])
   useEffect(() => {
     const ctl = new AbortController()
     api('tickets', undefined, ctl.signal)
@@ -138,6 +163,8 @@ function Desk({
     const ctl = new AbortController()
     current.current = ctl
     setId(ticket)
+    setRunId('')
+    setFailed('')
     setEntries([])
     setInvestigating(false)
     setBusy(!!ticket)
@@ -149,6 +176,10 @@ function Desk({
         ).json()
         for (const run of detail.runs) {
           ctl.signal.throwIfAborted()
+          if (run.status === 'running') {
+            setRunId(run.id)
+            setInvestigating(true)
+          }
           await subscribe(run.id, ctl.signal)
         }
       }
@@ -156,12 +187,13 @@ function Desk({
       report(e)
     } finally {
       if (!ctl.signal.aborted) {
+        setRunId('')
         setBusy(false)
         setInvestigating(false)
       }
     }
   }
-  async function submit() {
+  async function submit(resume?: string) {
     const ctl = new AbortController()
     current.current = ctl
     setInvestigating(true)
@@ -176,16 +208,19 @@ function Desk({
         setTickets((prev) => [t, ...prev])
       }
       const question =
+        (resume && questions.current.get(resume)) ||
         message.trim() ||
         cases.find((c) => c.id === scenario)?.title ||
-        '调查 403'
-      const { runId } = await (
-        await api(
-          'tickets/' + ticket + '/runs',
-          { message: question, client_request_id: crypto.randomUUID() },
-          ctl.signal,
-        )
-      ).json()
+        '调查当前工单'
+      const { runId } = await startRun(
+        api,
+        ticket,
+        question,
+        ctl.signal,
+        resume,
+      )
+      questions.current.set(runId, question)
+      setRunId(runId)
       setMessage('')
       if (await subscribe(runId, ctl.signal)) {
         localStorage.setItem(
@@ -197,6 +232,7 @@ function Desk({
       report(e)
     } finally {
       if (!ctl.signal.aborted) {
+        setRunId('')
         setBusy(false)
         setInvestigating(false)
       }
@@ -214,6 +250,10 @@ function Desk({
           await api('tickets/' + id, undefined, ctl.signal)
         ).json()
         if (ctl.signal.aborted) return
+        const last = detail.runs.at(-1)
+        setFailed(
+          last?.status === 'failed' && last.has_checkpoint ? last.id : '',
+        )
         setSession(detail.session)
         setDemo(detail.demo)
         setStale(
@@ -232,8 +272,12 @@ function Desk({
     return () => {
       ctl.abort()
     }
-  }, [id, revision.ticket, revision.change])
+  }, [id, revision.ticket, revision.change, busy])
   const selected = tickets.find((t) => t.id === id)
+  const controls =
+    plugins.find(
+      (p) => p.enabled && p.scenarios.some((s) => s.id === selected?.scenario),
+    )?.uiManifest.demoControls?.[selected?.scenario ?? ''] ?? []
   const [query, setQuery] = useState('')
   function completionTime(ticket: string) {
     const date = localStorage.getItem('desk-completed-' + user + '-' + ticket)
@@ -247,7 +291,8 @@ function Desk({
     ) : null
   }
   const caseTitle = (ticket: Ticket) =>
-    cases.find((c) => c.id === ticket.scenario)?.title ?? '工单'
+    plugins.flatMap((p) => p.scenarios).find((c) => c.id === ticket.scenario)
+      ?.title ?? '工单'
   const matches = tickets.filter((t) =>
     (t.id + ' 案例 ' + t.scenario + ' ' + caseTitle(t))
       .toLowerCase()
@@ -267,7 +312,34 @@ function Desk({
   const historyCount = evidence.filter(historical).length
   const groups: Entry[][] = []
   let summary: string | undefined
+  const activeTools = new Map<string, number>()
+  let progress = '',
+    preview = ''
   for (const entry of entries) {
+    if (['started', 'model', 'final', 'error'].includes(entry.type)) {
+      activeTools.clear()
+      progress = preview = ''
+    }
+    if (entry.type === 'tool_progress' && entry.source) {
+      if (entry.detail) {
+        groups.push([{ ...entry, text: entry.source + ' · ' + entry.detail }])
+        continue
+      }
+      const count =
+        (activeTools.get(entry.source) ?? 0) +
+        (entry.status === 'running' ? 1 : -1)
+      if (count > 0) activeTools.set(entry.source, count)
+      else activeTools.delete(entry.source)
+      continue
+    }
+    if (entry.type === 'reply_progress') {
+      progress = entry.status === 'thinking' ? '正在分析证据…' : '正在撰写回复…'
+      continue
+    }
+    if (entry.type === 'reply_preview') {
+      preview = entry.text ?? ''
+      continue
+    }
     if (entry.type === 'started') continue
     if (entry.type === 'question') summary = undefined
     if (entry.type === 'model') {
@@ -310,14 +382,16 @@ function Desk({
     if (scroll.current && follow.current)
       scroll.current.scrollTop = scroll.current.scrollHeight
   }, [entries])
-  const canSend = !busy && (!id || !!message.trim())
+  const canSend = runId
+    ? !!message.trim()
+    : !busy && (id ? !!message.trim() : !!scenario)
   const roles: Record<string, string> = {
     alice: '申请人',
     bob: '申请人',
     carol: '审批人',
     guest: '跨租户',
   }
-  const title = cases.find((c) => c.id === selected?.scenario)?.title
+  const title = selected && caseTitle(selected)
   function openTicket(ticket: string) {
     follow.current = true
     setMessage('')
@@ -450,6 +524,7 @@ function Desk({
                     </div>
                     <h2>开始工单调查</h2>
                     <div className="scenarios">
+                      {!cases.length && <p>当前没有可用的调查场景。</p>}
                       {cases.map((c) => (
                         <Button
                           variant="outline"
@@ -459,7 +534,7 @@ function Desk({
                             setMessage(c.title)
                           }}
                         >
-                          {c.id === 'A' ? <Monitor /> : <FolderKey />}
+                          <FolderKey />
                           <span>
                             <small>案例 {c.id}</small>
                             {c.title}
@@ -485,6 +560,7 @@ function Desk({
                           {group.map((e) => (
                             <Observation
                               key={e.evidenceId}
+                              observationMeta={observationMeta}
                               e={e}
                               historical={historical(e)}
                             />
@@ -494,10 +570,15 @@ function Desk({
                         <Observation key={i} e={group[0]} historical={false} />
                       ),
                     )}
+                    {investigating && preview && (
+                      <p className="entry chat-markdown">{preview}</p>
+                    )}
                     {investigating && (
                       <div className="event">
                         <LoaderCircle size={14} className="animate-spin" />
-                        正在取证…
+                        {activeTools.size
+                          ? '正在执行 ' + [...activeTools.keys()].join('、')
+                          : progress || '正在取证…'}
                       </div>
                     )}
                   </div>
@@ -510,6 +591,15 @@ function Desk({
           </ScrollArea.Root>
           <div className="composer-wrap">
             {error && <p role="alert">{error}</p>}
+            {failed && !busy && (
+              <Button
+                disabled={!questions.current.has(failed) && !message.trim()}
+                onClick={() => void submit(failed)}
+              >
+                从检查点续跑
+                {!questions.current.has(failed) && '（请输入原调查问题）'}
+              </Button>
+            )}
             <form
               data-slot="composer-host"
               className="composer"
@@ -517,14 +607,31 @@ function Desk({
                 e.preventDefault()
                 if (canSend) {
                   follow.current = true
-                  void submit()
+                  if (runId) {
+                    const sent = message
+                    const signal = current.current?.signal
+                    void steer(api, runId, sent.trim(), signal)
+                      .then(() => {
+                        if (!signal?.aborted) {
+                          setMessage((value) => (value === sent ? '' : value))
+                          toast.success('纠偏指令已提交')
+                        }
+                      })
+                      .catch(report)
+                  } else void submit()
                 }
               }}
             >
               <textarea
                 aria-label="调查问题"
                 rows={2}
-                placeholder={id ? '继续追问…' : '描述遇到的问题…'}
+                placeholder={
+                  runId
+                    ? '输入运行中纠偏指令…'
+                    : id
+                      ? '继续追问…'
+                      : '描述遇到的问题…'
+                }
                 value={message}
                 onChange={(e) => setMessage(e.target.value)}
                 onKeyDown={(e) => {
@@ -562,7 +669,9 @@ function Desk({
                   type="submit"
                   variant="primary"
                   disabled={!canSend}
-                  label={id ? '发送追问' : '创建并调查'}
+                  label={
+                    runId ? '发送纠偏指令' : id ? '发送追问' : '创建并调查'
+                  }
                 >
                   {busy ? (
                     <LoaderCircle className="animate-spin" />
@@ -582,7 +691,36 @@ function Desk({
         >
           <div {...right.handle} />
           <div className="details-scroll">
+            <details className="details-section">
+              <summary>租户插件与用量</summary>
+              {plugins.map((p) => (
+                <article className="panel" key={p.id}>
+                  <strong>{p.title}</strong>
+                  <p>
+                    {p.id}@{p.version} · 在途 {p.activeRefs}
+                  </p>
+                  <span>{p.enabled ? '已启用' : '已停用'}</span>
+                  {user === 'carol' && (
+                    <Switch
+                      disabled={false}
+                      label={'启停' + p.title}
+                      checked={p.enabled}
+                      onChange={(enabled) => {
+                        void toggle(api, p.id, enabled).catch(report)
+                      }}
+                    />
+                  )}
+                </article>
+              ))}
+              {usage && (
+                <p>
+                  缓存读取 {usage.cache_read_tokens} · 缓存写入{' '}
+                  {usage.cache_write_tokens} tokens · 费用 USD {usage.cost_usd}
+                </p>
+              )}
+            </details>
             <Changes
+              actionMeta={plugins}
               revision={revision.change}
               user={user}
               api={api}
@@ -591,7 +729,7 @@ function Desk({
             />
             <section className="details-section">
               <h3>运行环境</h3>
-              {demo && selected?.scenario === 'B' && (
+              {demo && controls.includes('session') && (
                 <div className="control">
                   <span>桌面会话</span>
                   <Select
@@ -618,7 +756,7 @@ function Desk({
                   />
                 </div>
               )}
-              {available && (
+              {available && controls.includes('fault') && (
                 <div className="control fault">
                   <span>外部权限 503</span>
                   <Switch
